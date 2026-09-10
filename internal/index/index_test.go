@@ -327,3 +327,130 @@ func TestLive(t *testing.T) {
 		}
 	}
 }
+
+// buildHotIndex builds the same fixture with a threshold low enough that ordinary
+// prefixes become hot, so the precomputed path is exercised.
+func buildHotIndex(t *testing.T, threshold int) *Index {
+	t.Helper()
+	dir := t.TempDir()
+	rows := []string{
+		dumpRow("1", "London", "London", "Лондон,Λονδίνο,倫敦,ロンドン", "51.50853", "-0.12574", "PPLC", "GB", "ENG", "8961989"),
+		dumpRow("2", "Lodz", "Lodz", "", "51.75", "19.46667", "PPLA", "PL", "73", "768755"),
+		dumpRow("3", "Loja", "Loja", "", "-3.99313", "-79.20422", "PPLA", "EC", "12", "180617"),
+		dumpRow("4", "Lome", "Lome", "", "6.13748", "1.21227", "PPLC", "TG", "24", "749700"),
+		// Deliberately alphabetically first and utterly obscure: a scan that
+		// samples by spelling would surface this instead of the capitals above.
+		dumpRow("5", "Loa", "Loa", "", "38.4", "-111.64", "PPL", "US", "UT", "0"),
+		dumpRow("6", "Loachapoka", "Loachapoka", "", "32.6", "-85.59", "PPL", "US", "AL", "0"),
+	}
+	dumpPath := filepath.Join(dir, "allCountries.zip")
+	writeZip(t, dumpPath, "allCountries.txt", strings.Join(rows, "\n")+"\n")
+
+	admin1 := "GB.ENG\tEngland\tEngland\t1\nPL.73\tLodz Voivodeship\tLodz\t2\nEC.12\tLoja\tLoja\t3\n" +
+		"TG.24\tMaritime\tMaritime\t4\nUS.UT\tUtah\tUtah\t5\nUS.AL\tAlabama\tAlabama\t6\n"
+	admin1Path := filepath.Join(dir, "admin1CodesASCII.txt")
+	if err := os.WriteFile(admin1Path, []byte(admin1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	country := "#header\nGB\t\t\t\tUnited Kingdom\nPL\t\t\t\tPoland\nEC\t\t\t\tEcuador\n" +
+		"TG\t\t\t\tTogo\nUS\t\t\t\tUnited States\n"
+	countryPath := filepath.Join(dir, "countryInfo.txt")
+	if err := os.WriteFile(countryPath, []byte(country), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(dir, "index")
+	m, err := Build(BuildOptions{
+		DumpPath: dumpPath, Admin1Path: admin1Path, CountryPath: countryPath,
+		OutDir: out, HotThreshold: threshold,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Logf("threshold %d -> %d hot prefixes", threshold, m.HotPrefixes)
+	ix, err := Open(out)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	return ix
+}
+
+// A hot prefix must return the highest-scoring places beneath it, not whichever
+// keys happen to sort first. Before hot prefixes existed, "p" returned Pa Sang,
+// Thailand rather than Paris for exactly this reason.
+func TestHotPrefixRanksByScoreNotSpelling(t *testing.T) {
+	ix := buildHotIndex(t, 2)
+
+	res, err := ix.Search("lo", SearchOptions{Limit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 {
+		t.Fatal("no results for a hot prefix")
+	}
+	if res[0].ID != 1 {
+		t.Errorf("top result = %d (%s), want London (1)", res[0].ID, res[0].Name)
+	}
+	for i, r := range res {
+		if r.ID == 5 || r.ID == 6 {
+			t.Errorf("obscure alphabetically-first place %q ranked %d, above real cities", r.Name, i+1)
+		}
+	}
+}
+
+// Hot and scanned prefixes must agree: the shortlist is an optimisation, not a
+// different ranking. The same fixture is built twice, once with a threshold low
+// enough that "lo" earns a shortlist and once with one high enough that it does
+// not, and both must answer identically.
+func TestHotAndScannedPathsAgree(t *testing.T) {
+	hot := buildHotIndex(t, 2)
+	scanned := buildHotIndex(t, 1_000_000)
+
+	if hot.Manifest().HotPrefixes == 0 {
+		t.Fatal("low threshold produced no hot prefixes")
+	}
+	if n := scanned.Manifest().HotPrefixes; n != 0 {
+		t.Fatalf("high threshold produced %d hot prefixes, want 0", n)
+	}
+
+	for _, q := range []string{"l", "lo", "lon", "loa", "london"} {
+		for _, home := range []string{"", "US"} {
+			a, err := hot.Search(q, SearchOptions{Limit: 6, Home: home})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := scanned.Search(q, SearchOptions{Limit: 6, Home: home})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(a) != len(b) {
+				t.Errorf("query %q home %q: hot returned %d results, scanned %d", q, home, len(a), len(b))
+				continue
+			}
+			for i := range a {
+				if a[i].ID != b[i].ID || a[i].Score != b[i].Score {
+					t.Errorf("query %q home %q result %d: hot %d@%v, scanned %d@%v",
+						q, home, i, a[i].ID, a[i].Score, b[i].ID, b[i].Score)
+				}
+			}
+		}
+	}
+}
+
+// The exact-match bonus is a query-time adjustment, so it has to be applied even
+// when the candidates came from a precomputed list.
+func TestHotPrefixStillHonoursExactMatch(t *testing.T) {
+	ix := buildHotIndex(t, 2)
+	res, err := ix.Search("loa", SearchOptions{Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) == 0 || res[0].ID != 5 {
+		got := int32(0)
+		if len(res) > 0 {
+			got = res[0].ID
+		}
+		t.Errorf("exact query %q top result = %d, want Loa (5)", "loa", got)
+	}
+}

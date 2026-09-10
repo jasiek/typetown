@@ -99,6 +99,18 @@ than the data: an exact-match bonus, and an optional bias toward a home country.
 They are applied as a bounded re-rank over a pool of candidates pulled from the
 merge.
 
+### Hot prefixes
+
+A short prefix has an enormous number of keys beneath it — `p` covers 333,538 —
+which is far too many to walk on every keystroke. Truncating the walk is not an
+answer, because the FST yields keys alphabetically: a cap silently ranks by
+spelling, and `p` returns Pa Sang, Thailand instead of Paris.
+
+Nearly all of that cost sits in a few thousand prefixes, so the build
+precomputes a ranked shortlist for every prefix with at least 500 keys beneath
+it — about 6,500 of them, 8 MB — and scans everything else exhaustively, which
+is cheap precisely because it is not hot.
+
 ## Layout
 
 ```

@@ -25,6 +25,9 @@ type BuildOptions struct {
 	CountryPath  string
 	OutDir       string
 	Filter       geonames.Filter
+	// HotThreshold overrides how many keys a prefix needs before it earns a
+	// precomputed shortlist. Zero selects the default.
+	HotThreshold int
 	Progress     func(stage string, n int)
 }
 
@@ -62,6 +65,9 @@ type builder struct {
 func Build(opts BuildOptions) (*Manifest, error) {
 	if opts.Progress == nil {
 		opts.Progress = func(string, int) {}
+	}
+	if opts.HotThreshold <= 0 {
+		opts.HotThreshold = defaultHotThreshold
 	}
 	tables, err := geonames.LoadTables(opts.Admin1Path, opts.CountryPath)
 	if err != nil {
@@ -281,9 +287,16 @@ func (b *builder) writeIndex() (*Manifest, error) {
 	}
 	b.opts.Progress("keys", nkeys)
 
+	nhot, err := b.writeHotPrefixes()
+	if err != nil {
+		return nil, err
+	}
+	b.opts.Progress("hot prefixes", nhot)
+
 	m := &Manifest{
 		Version: FormatVersion, Built: time.Now().UTC().Format(time.RFC3339),
 		Source: "geonames", Records: len(b.recOffsets) - 1, Keys: nkeys, Postings: npost,
+		HotPrefixes: nhot, HotThreshold: b.opts.HotThreshold, HotK: hotK,
 		Countries: b.countries, CountryNames: b.countryNames,
 		Regions: b.regions, FeatureCodes: b.features,
 		Filter: describeFilter(b.opts.Filter),
@@ -375,4 +388,107 @@ func describeFilter(f geonames.Filter) string {
 		return "none"
 	}
 	return strings.Join(parts, " ")
+}
+
+// writeHotPrefixes precomputes a ranked shortlist for every prefix with enough
+// keys beneath it that scanning them on each keystroke would be too slow.
+//
+// b.keys is already sorted by key, so every prefix's keys are contiguous and one
+// pass suffices: a prefix ends exactly where the current key stops sharing it
+// with the previous one.
+func (b *builder) writeHotPrefixes() (int, error) {
+	type hotEntry struct {
+		prefix string
+		list   []candidate
+	}
+	var hots []hotEntry
+
+	levels := make([]*topK, maxPrefixLen+1)
+	counts := make([]int, maxPrefixLen+1)
+	for i := 1; i <= maxPrefixLen; i++ {
+		levels[i] = newTopK()
+	}
+
+	var prev []byte
+	// flush closes out every prefix level at or below `from`, emitting the ones
+	// that turned out to be hot.
+	flush := func(from int) {
+		for L := maxPrefixLen; L >= from; L-- {
+			if counts[L] >= b.opts.HotThreshold && L <= len(prev) {
+				hots = append(hots, hotEntry{string(prev[:L]), levels[L].drain()})
+			}
+			levels[L].reset()
+			counts[L] = 0
+		}
+	}
+
+	for i, k := range b.keys {
+		key := b.key(k)
+		newKey := i == 0 || !slices.Equal(key, prev)
+		if i > 0 && newKey {
+			flush(commonPrefixLen(key, prev) + 1)
+		}
+		score := EdgeScore(float64(b.prominence[k.ord]), geonames.Class(k.class))
+		for L := 1; L <= min(len(key), maxPrefixLen); L++ {
+			if newKey {
+				counts[L]++
+			}
+			// Postings arrive in descending score order, so once a key can no
+			// longer beat the retained minimum, neither can the rest of it.
+			if score > levels[L].min() {
+				levels[L].add(k.ord, score)
+			}
+		}
+		prev = key
+	}
+	flush(1)
+
+	slices.SortFunc(hots, func(x, y hotEntry) int { return strings.Compare(x.prefix, y.prefix) })
+
+	hf, err := os.Create(filepath.Join(b.opts.OutDir, hotFile))
+	if err != nil {
+		return 0, fmt.Errorf("create hot lists: %w", err)
+	}
+	defer hf.Close()
+	hw := bufio.NewWriterSize(hf, 1<<20)
+
+	ff, err := os.Create(filepath.Join(b.opts.OutDir, hotFSTFile))
+	if err != nil {
+		return 0, fmt.Errorf("create hot fst: %w", err)
+	}
+	defer ff.Close()
+	fw := bufio.NewWriterSize(ff, 1<<20)
+	fst, err := vellum.New(fw, nil)
+	if err != nil {
+		return 0, fmt.Errorf("new hot fst: %w", err)
+	}
+
+	var off uint64
+	var scratch []byte
+	for _, h := range hots {
+		scratch = scratch[:0]
+		scratch = binary.AppendUvarint(scratch, uint64(len(h.list)))
+		for _, c := range h.list {
+			scratch = binary.AppendUvarint(scratch, uint64(c.ord))
+			scratch = binary.AppendVarint(scratch, int64(c.score*scoreScale))
+		}
+		if err := fst.Insert([]byte(h.prefix), off); err != nil {
+			return 0, fmt.Errorf("hot fst insert %q: %w", h.prefix, err)
+		}
+		n, err := hw.Write(scratch)
+		if err != nil {
+			return 0, fmt.Errorf("write hot list: %w", err)
+		}
+		off += uint64(n)
+	}
+	if err := fst.Close(); err != nil {
+		return 0, fmt.Errorf("close hot fst: %w", err)
+	}
+	if err := fw.Flush(); err != nil {
+		return 0, fmt.Errorf("flush hot fst: %w", err)
+	}
+	if err := hw.Flush(); err != nil {
+		return 0, fmt.Errorf("flush hot lists: %w", err)
+	}
+	return len(hots), nil
 }

@@ -20,14 +20,18 @@ type Index struct {
 	postings []byte
 	records  []byte
 	offsets  []uint32
+
+	hotFST  *vellum.FST
+	hotList []byte
 }
 
 // SearchOptions tunes a single query.
 type SearchOptions struct {
 	Limit int    // results to return; defaults to 10
 	Home  string // ISO-3166 alpha-2 of the caller's country; "" disables the bias
-	// Pool bounds the re-rank: the merge pulls this many candidates before
-	// query-time bonuses are applied. Larger is more accurate and slower.
+	// Pool caps how many candidates a scan may gather. It only applies to
+	// prefixes that were not hot enough to earn a precomputed list, which by
+	// construction have few keys beneath them.
 	Pool int
 }
 
@@ -62,6 +66,14 @@ func Open(dir string) (*Index, error) {
 	if err := idx.buildOffsets(); err != nil {
 		return nil, err
 	}
+	idx.hotFST, err = vellum.Open(filepath.Join(dir, hotFSTFile))
+	if err != nil {
+		return nil, fmt.Errorf("open hot fst: %w", err)
+	}
+	idx.hotList, err = os.ReadFile(filepath.Join(dir, hotFile))
+	if err != nil {
+		return nil, fmt.Errorf("open hot lists: %w", err)
+	}
 	return idx, nil
 }
 
@@ -87,7 +99,14 @@ func (ix *Index) buildOffsets() error {
 }
 
 func (ix *Index) Manifest() *Manifest { return ix.m }
-func (ix *Index) Close() error        { return ix.fst.Close() }
+
+func (ix *Index) Close() error {
+	err := ix.fst.Close()
+	if herr := ix.hotFST.Close(); err == nil {
+		err = herr
+	}
+	return err
+}
 
 type candidate struct {
 	ord   uint32
@@ -97,43 +116,35 @@ type candidate struct {
 // Search returns the best matches for a query, ranked.
 //
 // The query is folded the same way keys were at build time, then used as a
-// prefix over the FST. Each matching key yields a posting list that is already
-// in descending score order, so ranking is a merge rather than a scan.
+// prefix over the FST. Each matching key yields a posting list already in
+// descending score order, so ranking is a merge rather than a scan.
 func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = 10
 	}
 	if opts.Pool <= 0 {
-		opts.Pool = 2000
+		opts.Pool = 20000
 	}
 	q := geonames.Fold(query)
 	if q == "" {
 		return nil, nil
 	}
 
-	best := make(map[uint32]float64, opts.Pool)
-	it, err := ix.fst.Iterator([]byte(q), prefixSuccessor(q))
-	for err == nil {
-		key, off := it.Current()
-		exact := len(key) == len(q)
-		if perr := ix.eachPosting(off, func(ord uint32, score float64) bool {
-			if exact {
-				score += ExactBonus
-			}
-			if cur, ok := best[ord]; !ok || score > cur {
-				best[ord] = score
-			}
-			return len(best) < opts.Pool
-		}); perr != nil {
-			return nil, perr
+	best := make(map[uint32]float64, 1024)
+	keep := func(ord uint32, score float64) {
+		if cur, ok := best[ord]; !ok || score > cur {
+			best[ord] = score
 		}
-		if len(best) >= opts.Pool {
-			break
-		}
-		err = it.Next()
 	}
-	if err != nil && err != vellum.ErrIteratorDone {
-		return nil, fmt.Errorf("search %q: %w", query, err)
+
+	hot, err := ix.gatherHot(q, keep)
+	if err != nil {
+		return nil, err
+	}
+	if !hot {
+		if err := ix.gatherScan(q, opts.Pool, keep); err != nil {
+			return nil, err
+		}
 	}
 
 	cands := make([]candidate, 0, len(best))
@@ -143,14 +154,7 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	// The home-country bonus depends on the caller, so it cannot be baked into
 	// the stored scores; it is applied here, over the pool, before trimming.
 	if opts.Home != "" {
-		home := -1
-		for i, cc := range ix.m.Countries {
-			if cc == opts.Home {
-				home = i
-				break
-			}
-		}
-		if home >= 0 {
+		if home := ix.countryIndex(opts.Home); home >= 0 {
 			for i := range cands {
 				if ix.countryOf(cands[i].ord) == home {
 					cands[i].score += HomeBonus
@@ -179,25 +183,97 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	return out, nil
 }
 
-func (ix *Index) eachPosting(off uint64, fn func(ord uint32, score float64) bool) error {
-	if off >= uint64(len(ix.postings)) {
-		return fmt.Errorf("postings offset %d out of range", off)
+// gatherHot serves a prefix that has a precomputed shortlist, and reports
+// whether it did. The shortlist is a ranked sample rather than the whole range,
+// so an exact hit on the query itself is added separately: it carries a bonus
+// the build-time score could not know about.
+func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
+	off, ok, err := ix.hotFST.Get([]byte(q))
+	if err != nil {
+		return false, fmt.Errorf("hot lookup %q: %w", q, err)
 	}
-	buf := ix.postings[off:]
+	if !ok {
+		return false, nil
+	}
+	if err := ix.eachEntry(ix.hotList, off, func(ord uint32, score float64) bool {
+		keep(ord, score)
+		return true
+	}); err != nil {
+		return false, err
+	}
+	if poff, exact, err := ix.fst.Get([]byte(q)); err != nil {
+		return false, fmt.Errorf("exact lookup %q: %w", q, err)
+	} else if exact {
+		if err := ix.eachEntry(ix.postings, poff, func(ord uint32, score float64) bool {
+			keep(ord, score+ExactBonus)
+			return true
+		}); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// gatherScan walks every key under a prefix. It is only reached for prefixes
+// that were not hot, which by construction have few keys beneath them, so the
+// pool ceiling is a safety net rather than a sampling policy.
+func (ix *Index) gatherScan(q string, pool int, keep func(uint32, float64)) error {
+	n := 0
+	it, err := ix.fst.Iterator([]byte(q), prefixSuccessor(q))
+	for err == nil {
+		key, off := it.Current()
+		bonus := 0.0
+		if len(key) == len(q) {
+			bonus = ExactBonus
+		}
+		if perr := ix.eachEntry(ix.postings, off, func(ord uint32, score float64) bool {
+			keep(ord, score+bonus)
+			n++
+			return n < pool
+		}); perr != nil {
+			return perr
+		}
+		if n >= pool {
+			break
+		}
+		err = it.Next()
+	}
+	if err != nil && err != vellum.ErrIteratorDone {
+		return fmt.Errorf("search %q: %w", q, err)
+	}
+	return nil
+}
+
+func (ix *Index) countryIndex(cc string) int {
+	for i, c := range ix.m.Countries {
+		if c == cc {
+			return i
+		}
+	}
+	return -1
+}
+
+// eachEntry decodes a (count, then count x (ordinal, score)) list. Both
+// postings.bin and hot.bin use this encoding.
+func (ix *Index) eachEntry(src []byte, off uint64, fn func(ord uint32, score float64) bool) error {
+	if off >= uint64(len(src)) {
+		return fmt.Errorf("list offset %d out of range", off)
+	}
+	buf := src[off:]
 	n, w := binary.Uvarint(buf)
 	if w <= 0 {
-		return fmt.Errorf("postings offset %d: bad count", off)
+		return fmt.Errorf("list offset %d: bad count", off)
 	}
 	buf = buf[w:]
 	for i := uint64(0); i < n; i++ {
 		ord, w1 := binary.Uvarint(buf)
 		if w1 <= 0 {
-			return fmt.Errorf("postings offset %d: bad ordinal", off)
+			return fmt.Errorf("list offset %d: bad ordinal", off)
 		}
 		buf = buf[w1:]
 		sc, w2 := binary.Varint(buf)
 		if w2 <= 0 {
-			return fmt.Errorf("postings offset %d: bad score", off)
+			return fmt.Errorf("list offset %d: bad score", off)
 		}
 		buf = buf[w2:]
 		if !fn(uint32(ord), float64(sc)/scoreScale) {

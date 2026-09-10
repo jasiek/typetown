@@ -6,6 +6,8 @@
 //	names.fst      finite state transducer: folded name -> postings.bin offset
 //	postings.bin   per key, the matching records in descending score order
 //	records.bin    packed place records, addressed by ordinal
+//	hot.fst        the prefixes with too many keys to scan -> hot.bin offset
+//	hot.bin        per hot prefix, a precomputed top-K in descending score order
 //
 // The split exists so that a query touches as little as possible: walking a
 // prefix reads only the FST, and only the handful of records that survive
@@ -16,12 +18,14 @@ const (
 	// FormatVersion is bumped whenever the on-disk encoding changes in a way a
 	// previously built index cannot survive. Readers refuse mismatches rather
 	// than misinterpreting bytes.
-	FormatVersion = 1
+	FormatVersion = 2
 
 	manifestFile = "manifest.json"
 	fstFile      = "names.fst"
 	postingsFile = "postings.bin"
 	recordsFile  = "records.bin"
+	hotFSTFile   = "hot.fst"
+	hotFile      = "hot.bin"
 
 	// coordScale converts degrees to the fixed-point integers stored in records.
 	// GeoNames publishes five decimal places, i.e. about one metre.
@@ -41,6 +45,9 @@ type Manifest struct {
 	Records      int      `json:"records"`
 	Keys         int      `json:"keys"`
 	Postings     int      `json:"postings"`
+	HotPrefixes  int      `json:"hotPrefixes"`
+	HotThreshold int      `json:"hotThreshold"`
+	HotK         int      `json:"hotK"`
 	Countries    []string `json:"countries"`    // parallel to CountryNames
 	CountryNames []string `json:"countryNames"` //
 	Regions      []string `json:"regions"`      // display names of admin1 divisions
