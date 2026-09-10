@@ -1,100 +1,21 @@
 package typetown_test
 
 import (
-	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/jasiek/typetown"
-	"github.com/jasiek/typetown/internal/geonames"
-	"github.com/jasiek/typetown/internal/index"
+	"github.com/jasiek/typetown/internal/testindex"
 )
-
-// dumpRow builds one line of the geoname table. Only the columns the builder
-// reads carry meaning; the row must still be the right width.
-func dumpRow(id, name, lat, lon, fcode, cc, admin1, pop string) string {
-	cols := make([]string, 19)
-	cols[0], cols[1], cols[2] = id, name, name
-	cols[4], cols[5] = lat, lon
-	cols[6], cols[7] = "P", fcode
-	cols[8], cols[10] = cc, admin1
-	cols[14] = pop
-	return strings.Join(cols, "\t")
-}
-
-// buildFixture writes a miniature set of GeoNames inputs and builds an index.
-func buildFixture(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-
-	rows := []string{
-		dumpRow("2643743", "London", "51.50853", "-0.12574", "PPLC", "GB", "ENG", "8961989"),
-		dumpRow("4298960", "London", "37.12898", "-84.08326", "PPLA2", "US", "KY", "8126"),
-		dumpRow("3466512", "Londrina", "-23.31028", "-51.16278", "PPLA2", "BR", "18", "581382"),
-		dumpRow("1880252", "Singapore", "1.28967", "103.85007", "PPLC", "SG", "00", "3547809"),
-		dumpRow("2761369", "Wien", "48.20849", "16.37208", "PPLC", "AT", "09", "1691468"),
-		// Two near-equal rivals, so the home bias has a case it can decide. It is
-		// deliberately a nudge, not an override: it will not flip London.
-		dumpRow("2207266", "Springfield", "-43.31667", "172.16667", "PPL", "NZ", "E9", "200000"),
-		dumpRow("4250542", "Springfield", "39.80172", "-89.64371", "PPL", "US", "IL", "100000"),
-		// A second American Springfield, larger than the first. Only coordinates
-		// can choose between them; a country code cannot.
-		dumpRow("4409896", "Springfield", "37.21533", "-93.29824", "PPL", "US", "MO", "170188"),
-	}
-	dumpPath := filepath.Join(dir, "allCountries.zip")
-	f, err := os.Create(dumpPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	zw := zip.NewWriter(f)
-	w, err := zw.Create("allCountries.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte(strings.Join(rows, "\n") + "\n")); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-
-	admin1 := "GB.ENG\tEngland\tEngland\t1\nUS.KY\tKentucky\tKentucky\t2\n" +
-		"BR.18\tParana\tParana\t3\nAT.09\tVienna\tVienna\t4\n" +
-		"NZ.E9\tCanterbury\tCanterbury\t5\nUS.IL\tIllinois\tIllinois\t6\n" +
-		"US.MO\tMissouri\tMissouri\t7\n"
-	admin1Path := filepath.Join(dir, "admin1CodesASCII.txt")
-	if err := os.WriteFile(admin1Path, []byte(admin1), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	country := "#header line\n" +
-		"GB\t\t\t\tUnited Kingdom\nUS\t\t\t\tUnited States\nBR\t\t\t\tBrazil\n" +
-		"SG\t\t\t\tSingapore\nAT\t\t\t\tAustria\nNZ\t\t\t\tNew Zealand\n"
-	countryPath := filepath.Join(dir, "countryInfo.txt")
-	if err := os.WriteFile(countryPath, []byte(country), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	out := filepath.Join(dir, "index")
-	if _, err := index.Build(index.BuildOptions{
-		DumpPath: dumpPath, Admin1Path: admin1Path, CountryPath: countryPath,
-		OutDir: out, Filter: geonames.Filter{},
-	}); err != nil {
-		t.Fatalf("build fixture: %v", err)
-	}
-	return out
-}
 
 func openFixture(t *testing.T) *typetown.Index {
 	t.Helper()
-	ix, err := typetown.Open(buildFixture(t))
+	ix, err := typetown.Open(testindex.Build(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -137,7 +58,7 @@ func TestSearchFoldsDiacritics(t *testing.T) {
 }
 
 func TestSearchAfterCloseFails(t *testing.T) {
-	ix, err := typetown.Open(buildFixture(t))
+	ix, err := typetown.Open(testindex.Build(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,8 +75,8 @@ func TestSearchAfterCloseFails(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	s := openFixture(t).Stats()
-	if s.Records != 8 {
-		t.Errorf("Records = %d, want 8", s.Records)
+	if s.Records != len(testindex.Default) {
+		t.Errorf("Records = %d, want %d", s.Records, len(testindex.Default))
 	}
 	if s.Version == 0 || s.Built == "" {
 		t.Errorf("Stats looks unpopulated: %+v", s)

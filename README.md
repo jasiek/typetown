@@ -144,6 +144,32 @@ Set `WithHomeHeader` only where a trusted proxy sets the header: otherwise a
 client chooses its own bias. The consequence is mild — results come back in a
 different order — but it is still input from the network.
 
+## Serve
+
+```sh
+typetown serve                                   # http://localhost:8080/places
+typetown serve -addr :8080 -home US -cors '*'    # reachable from elsewhere
+typetown serve -path /api/v1/places -quiet
+```
+
+```
+$ typetown serve -index index -home PL
+typetown v0.2.0 serving 5165450 places on http://127.0.0.1:8080/places
+  try: curl 'http://127.0.0.1:8080/places?q=lond&limit=3'
+GET /places?q=krak&limit=2 200 24.967ms
+GET /healthz 200 121µs
+```
+
+It serves the same handler the library exposes, so the command is a way to try
+the endpoint rather than a different implementation of it. `/healthz` reports
+what the open index holds. `SIGINT` and `SIGTERM` finish in-flight requests
+before exiting, so a container stop does not cut a response in half.
+
+The first request against a freshly opened index takes a few milliseconds and
+the rest take well under one: the index is memory-mapped, so the first touch of
+each region is a page fault. Under a shared volume the first replica pays that
+and the others start against a warm page cache.
+
 ## Benchmark
 
 `bench` measures latency, and accuracy too when the query set says what each
@@ -319,6 +345,7 @@ cmd/typetown/       thin main(): wires stdio into the CLI and exits
 internal/cli/       flag parsing, subcommand registry, usage
 internal/geonames/  parsing the dumps and folding names
 internal/index/     the on-disk format, the builder, and search
+internal/testindex/ miniature fixtures, so tests need no downloaded data
 ```
 
 Only the root package is public. Everything the library does not need to expose

@@ -53,6 +53,11 @@ var commands = []command{
 		run:     runQuery,
 	},
 	{
+		name:    "serve",
+		summary: "serve lookups over HTTP",
+		run:     runServe,
+	},
+	{
 		name:    "bench",
 		summary: "measure query latency and ranking accuracy",
 		run:     runBench,
