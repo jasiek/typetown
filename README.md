@@ -55,6 +55,22 @@ typetown query -json edinburgh         # machine-readable
 typetown query -i -home US             # interactive
 ```
 
+### Interactive
+
+`-i` on a terminal searches incrementally: results are redrawn on every
+keystroke, `↑`/`↓` move the selection, `enter` accepts it and `esc` quits.
+`ctrl-w` deletes a word, `ctrl-u` clears the line.
+
+The redraw goes to stderr and the accepted result to stdout, so the selection
+can be captured:
+
+```sh
+read -r town lat lon <<<"$(typetown query -i -home US)"
+```
+
+When stdin is not a terminal there are no keystrokes to react to, so `-i` falls
+back to reading whole lines.
+
 ## Benchmark
 
 `bench` measures latency, and accuracy too when the query set says what each

@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"typetown/internal/index"
 )
@@ -41,6 +44,12 @@ func runQuery(env Env, args []string) error {
 	if *interact {
 		if fs.NArg() > 0 {
 			return fmt.Errorf("query: -i takes no query argument")
+		}
+		// On a real terminal, search incrementally as the user types. When stdin
+		// is a pipe or a file there are no keystrokes to react to, so fall back
+		// to reading whole lines.
+		if fd, ok := terminalFd(env.Stdin); ok {
+			return liveSearch(env, ix, opts, *asJSON, fd)
 		}
 		return interactive(env, ix, opts, *asJSON)
 	}
@@ -95,6 +104,19 @@ func detail(r index.Result) string {
 	return r.Kind
 }
 
+// terminalFd reports the file descriptor behind r when it is an interactive
+// terminal. Env holds an io.Reader so tests can substitute a buffer, so the
+// concrete file has to be recovered here.
+func terminalFd(r io.Reader) (int, bool) {
+	f, ok := r.(interface{ Fd() uintptr })
+	if !ok {
+		return 0, false
+	}
+	fd := int(f.Fd())
+	return fd, term.IsTerminal(fd)
+}
+
+// interactive is the line-based fallback for non-terminal input.
 func interactive(env Env, ix *index.Index, opts index.SearchOptions, asJSON bool) error {
 	m := ix.Manifest()
 	fmt.Fprintf(env.Stdout, "typetown %s — %d places, %d keys. Type a place name; blank line or ctrl-d to quit.\n",
