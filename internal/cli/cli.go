@@ -27,6 +27,7 @@ const (
 // Env is everything a command needs from the outside world. Commands write to
 // these writers instead of os.Stdout/os.Stderr so tests can capture output.
 type Env struct {
+	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 }
@@ -45,6 +46,11 @@ var commands = []command{
 		name:    "build",
 		summary: "build an index from the GeoNames inputs",
 		run:     runBuild,
+	},
+	{
+		name:    "query",
+		summary: "look up places by name prefix (-i for interactive)",
+		run:     runQuery,
 	},
 	{
 		name:    "version",
