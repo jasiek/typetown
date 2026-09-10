@@ -1,0 +1,9 @@
+bin/
+*.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+sources/
