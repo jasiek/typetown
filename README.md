@@ -1,7 +1,10 @@
 # typetown
 
-A command-line tool that builds a finite state transducer based autocomplete
-index over the populated places of the world, and queries it.
+[![CI](https://github.com/jasiek/typetown/actions/workflows/ci.yml/badge.svg)](https://github.com/jasiek/typetown/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/jasiek/typetown.svg)](https://pkg.go.dev/github.com/jasiek/typetown)
+
+A finite state transducer autocomplete index over the populated places of the
+world: a command that builds it, and a Go library that queries it.
 
 Given a prefix of a town's name it returns the locality — town, first-order
 division, country — and its coordinates, so the result can be handed to
@@ -9,7 +12,7 @@ something that does proximity work.
 
 ```
 $ typetown query -home US "san fr"
-  San Francisco, California, United States         37.7749, -122.4194  pop 873965, PPLA2
+  San Francisco, California, United States          37.7749, -122.4194  pop 827526, PPLA2
 ```
 
 ## Requirements
