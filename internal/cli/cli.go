@@ -13,6 +13,10 @@ import (
 	"text/tabwriter"
 )
 
+// errParsed reports that a subcommand's flag set has already printed the
+// problem, so Run should exit with a usage code without printing anything more.
+var errParsed = errors.New("flag parse error")
+
 // Exit codes, following the usual Unix convention.
 const (
 	exitOK    = 0 // the command did what was asked
@@ -37,6 +41,11 @@ type command struct {
 
 // commands is the subcommand registry. Add new subcommands here.
 var commands = []command{
+	{
+		name:    "build",
+		summary: "build an index from the GeoNames inputs",
+		run:     runBuild,
+	},
 	{
 		name:    "version",
 		summary: "print the typetown version",
@@ -77,11 +86,16 @@ func Run(env Env, args []string) int {
 		if c.name != name {
 			continue
 		}
-		if err := c.run(env, rest); err != nil {
+		switch err := c.run(env, rest); {
+		case err == nil:
+			return exitOK
+		case errors.Is(err, errParsed):
+			// The subcommand's flag set already reported the problem.
+			return exitUsage
+		default:
 			fmt.Fprintf(env.Stderr, "typetown: %v\n", err)
 			return exitError
 		}
-		return exitOK
 	}
 
 	fmt.Fprintf(env.Stderr, "typetown: unknown command %q\n\n", name)
