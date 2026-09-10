@@ -7,3 +7,7 @@ bin/
 *.key
 *.crt
 sources/
+
+# built indexes. The leading slash matters: a bare "index/" would also
+# match internal/index/, which is source.
+/index/
