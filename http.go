@@ -2,6 +2,7 @@ package typetown
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -77,6 +78,7 @@ func WithCacheControl(v string) HandlerOption {
 // It handles one route and does not care where it is mounted:
 //
 //	GET <mount>?q=lond&limit=5&home=GB
+//	GET <mount>?q=lond&limit=5&lat=42.33&lon=-83.05
 //
 //	{"query":"lond","results":[{"id":2643743,"name":"London", ... }]}
 //
@@ -133,7 +135,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		limit = min(n, h.maxLimit)
 	}
 
-	results, err := h.ix.Search(q, SearchOptions{Limit: limit, Home: h.homeFor(r)})
+	near, err := nearFrom(r)
+	if err != nil {
+		h.fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	results, err := h.ix.Search(q, SearchOptions{
+		Limit: limit, Home: h.homeFor(r), Near: near,
+	})
 	if err != nil {
 		h.fail(w, http.StatusInternalServerError, "search failed")
 		return
@@ -151,6 +161,31 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(response{Query: q, Results: results})
+}
+
+// nearFrom reads the caller's position from the query string. lat and lon come
+// as a pair: one without the other is a mistake worth reporting rather than
+// silently ignoring. A position does not replace the country hint — both are
+// passed, and the ranking takes whichever helps more.
+func nearFrom(r *http.Request) (*LatLon, error) {
+	q := r.URL.Query()
+	latRaw := strings.TrimSpace(q.Get("lat"))
+	lonRaw := strings.TrimSpace(q.Get("lon"))
+	if latRaw == "" && lonRaw == "" {
+		return nil, nil
+	}
+	if latRaw == "" || lonRaw == "" {
+		return nil, errors.New("lat and lon must be given together")
+	}
+	lat, err := strconv.ParseFloat(latRaw, 64)
+	if err != nil || lat < -90 || lat > 90 {
+		return nil, errors.New("lat must be a number between -90 and 90")
+	}
+	lon, err := strconv.ParseFloat(lonRaw, 64)
+	if err != nil || lon < -180 || lon > 180 {
+		return nil, errors.New("lon must be a number between -180 and 180")
+	}
+	return &LatLon{Lat: lat, Lon: lon}, nil
 }
 
 // homeFor resolves the country to bias toward: the request's own parameter

@@ -109,6 +109,18 @@ http.Handle("/places", typetown.Handler(ix,
 ))
 ```
 
+The caller's position can be passed too, and is worth much more than the country:
+
+```
+GET /places?q=springfield&lat=39.80&lon=-89.64
+```
+
+`lat` and `lon` must be given together and must be in range, or the request is
+400. They combine with the country hint rather than replacing it, so sending
+both is safe. Coordinates in a query string end up in access logs and cache
+keys, so round them before sending — two decimal places is about a kilometre,
+which is all the ranking can use.
+
 ```
 GET /places?q=lond&limit=3&home=US
 

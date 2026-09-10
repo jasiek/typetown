@@ -42,6 +42,9 @@ func buildFixture(t *testing.T) string {
 		// deliberately a nudge, not an override: it will not flip London.
 		dumpRow("2207266", "Springfield", "-43.31667", "172.16667", "PPL", "NZ", "E9", "200000"),
 		dumpRow("4250542", "Springfield", "39.80172", "-89.64371", "PPL", "US", "IL", "100000"),
+		// A second American Springfield, larger than the first. Only coordinates
+		// can choose between them; a country code cannot.
+		dumpRow("4409896", "Springfield", "37.21533", "-93.29824", "PPL", "US", "MO", "170188"),
 	}
 	dumpPath := filepath.Join(dir, "allCountries.zip")
 	f, err := os.Create(dumpPath)
@@ -63,7 +66,8 @@ func buildFixture(t *testing.T) string {
 
 	admin1 := "GB.ENG\tEngland\tEngland\t1\nUS.KY\tKentucky\tKentucky\t2\n" +
 		"BR.18\tParana\tParana\t3\nAT.09\tVienna\tVienna\t4\n" +
-		"NZ.E9\tCanterbury\tCanterbury\t5\nUS.IL\tIllinois\tIllinois\t6\n"
+		"NZ.E9\tCanterbury\tCanterbury\t5\nUS.IL\tIllinois\tIllinois\t6\n" +
+		"US.MO\tMissouri\tMissouri\t7\n"
 	admin1Path := filepath.Join(dir, "admin1CodesASCII.txt")
 	if err := os.WriteFile(admin1Path, []byte(admin1), 0o644); err != nil {
 		t.Fatal(err)
@@ -148,8 +152,8 @@ func TestSearchAfterCloseFails(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	s := openFixture(t).Stats()
-	if s.Records != 7 {
-		t.Errorf("Records = %d, want 7", s.Records)
+	if s.Records != 8 {
+		t.Errorf("Records = %d, want 8", s.Records)
 	}
 	if s.Version == 0 || s.Built == "" {
 		t.Errorf("Stats looks unpopulated: %+v", s)
@@ -371,5 +375,138 @@ func TestHandlerMountsAnywhere(t *testing.T) {
 	}
 	if body.Results[0].Region != "" {
 		t.Errorf("city-state reported region %q, want empty", body.Results[0].Region)
+	}
+}
+
+// Coordinates should pick out the nearer of two same-named places, which is the
+// case a country code cannot decide.
+func TestSearchNear(t *testing.T) {
+	ix := openFixture(t)
+
+	// Christchurch, New Zealand — a few km from Springfield, NZ.
+	nzResults, err := ix.Search("springfield", typetown.SearchOptions{
+		Limit: 2, Near: &typetown.LatLon{Lat: -43.53, Lon: 172.63},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nzResults[0].CC != "NZ" {
+		t.Errorf("from Christchurch, first result was %s", nzResults[0].CC)
+	}
+
+	// Chicago — a couple of hundred km from Springfield, Illinois.
+	usResults, err := ix.Search("springfield", typetown.SearchOptions{
+		Limit: 2, Near: &typetown.LatLon{Lat: 41.88, Lon: -87.63},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usResults[0].CC != "US" {
+		t.Errorf("from Chicago, first result was %s", usResults[0].CC)
+	}
+}
+
+// Coordinates decide between two places in one country, which a country code
+// cannot. Missouri's Springfield is the larger, so it leads until the caller's
+// position says otherwise.
+func TestSearchNearSeparatesPlacesWithinACountry(t *testing.T) {
+	ix := openFixture(t)
+
+	plain, err := ix.Search("springfield", typetown.SearchOptions{Limit: 3, Home: "US"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain[0].Region != "Missouri" {
+		t.Fatalf("with only a country, first result was %s", plain[0].Region)
+	}
+
+	local, err := ix.Search("springfield", typetown.SearchOptions{
+		Limit: 3, Home: "US", Near: &typetown.LatLon{Lat: 39.80, Lon: -89.64},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local[0].Region != "Illinois" {
+		t.Errorf("standing in Springfield, Illinois, first result was %s", local[0].Region)
+	}
+}
+
+// The two hints combine by taking whichever helps more, so adding one can never
+// make a result score lower than it would have without it.
+func TestHintsAreMonotone(t *testing.T) {
+	ix := openFixture(t)
+	scoreOf := func(opts typetown.SearchOptions) map[int32]float64 {
+		t.Helper()
+		res, err := ix.Search("springfield", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[int32]float64{}
+		for _, r := range res {
+			m[r.ID] = r.Score
+		}
+		return m
+	}
+	none := scoreOf(typetown.SearchOptions{Limit: 5})
+	home := scoreOf(typetown.SearchOptions{Limit: 5, Home: "US"})
+	both := scoreOf(typetown.SearchOptions{Limit: 5, Home: "US",
+		Near: &typetown.LatLon{Lat: 41.88, Lon: -87.63}})
+
+	for id, base := range none {
+		if h, ok := home[id]; ok && h < base-1e-9 {
+			t.Errorf("record %d scored %v with a country hint, below %v without", id, h, base)
+		}
+		if b, ok := both[id]; ok {
+			if h, ok := home[id]; ok && b < h-1e-9 {
+				t.Errorf("record %d scored %v with a position added, below %v with the country alone", id, b, h)
+			}
+		}
+	}
+}
+
+// Proximity is bounded like the country bias: standing in a small town does not
+// make it outrank a capital.
+func TestSearchNearIsBounded(t *testing.T) {
+	ix := openFixture(t)
+	res, err := ix.Search("london", typetown.SearchOptions{
+		Limit: 2,
+		Near:  &typetown.LatLon{Lat: 37.13, Lon: -84.08}, // London, Kentucky itself
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].CC != "GB" {
+		t.Errorf("standing in London, Kentucky displaced London: %+v", res)
+	}
+}
+
+func TestHandlerNear(t *testing.T) {
+	h := typetown.Handler(openFixture(t))
+
+	_, nz := get(t, h, "/?q=springfield&lat=-43.53&lon=172.63")
+	if len(nz.Results) == 0 || nz.Results[0].CC != "NZ" {
+		t.Errorf("lat/lon near Christchurch gave %+v", nz.Results)
+	}
+	_, us := get(t, h, "/?q=springfield&lat=41.88&lon=-87.63")
+	if len(us.Results) == 0 || us.Results[0].CC != "US" {
+		t.Errorf("lat/lon near Chicago gave %+v", us.Results)
+	}
+
+	// lat and lon are a pair, and out-of-range values are a mistake, not a
+	// silently-ignored hint.
+	for _, bad := range []string{
+		"/?q=lond&lat=51.5",
+		"/?q=lond&lon=-0.12",
+		"/?q=lond&lat=abc&lon=-0.12",
+		"/?q=lond&lat=91&lon=0",
+		"/?q=lond&lat=0&lon=181",
+	} {
+		res, body := get(t, h, bad)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", bad, res.StatusCode)
+		}
+		if body.Error == "" {
+			t.Errorf("%s: no error message", bad)
+		}
 	}
 }

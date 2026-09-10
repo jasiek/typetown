@@ -35,10 +35,14 @@ type OpenOptions struct {
 	NoMmap bool
 }
 
+// LatLon is a point on the earth, in decimal degrees.
+type LatLon struct{ Lat, Lon float64 }
+
 // SearchOptions tunes a single query.
 type SearchOptions struct {
-	Limit int    // results to return; defaults to 10
-	Home  string // ISO-3166 alpha-2 of the caller's country; "" disables the bias
+	Limit int     // results to return; defaults to 10
+	Home  string  // ISO-3166 alpha-2 of the caller's country; "" disables the bias
+	Near  *LatLon // where the caller is; supersedes Home when set
 	// Pool caps how many candidates a scan may gather. It only applies to
 	// prefixes that were not hot enough to earn a precomputed list, which by
 	// construction have few keys beneath them.
@@ -187,17 +191,36 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	for ord, s := range best {
 		cands = append(cands, candidate{ord, s})
 	}
-	// The home-country bonus depends on the caller, so it cannot be baked into
-	// the stored scores; it is applied here, over the pool, before trimming.
-	if opts.Home != "" {
-		if home := ix.countryIndex(opts.Home); home >= 0 {
-			for i := range cands {
-				if ix.countryOf(cands[i].ord) == home {
-					cands[i].score += HomeBonus
+	// Where the caller is depends on the caller, so it cannot be baked into the
+	// stored scores; it is applied here, over the pool, before trimming.
+	//
+	// The country and the position add rather than replace one another. They are
+	// not the same statement: the country says "somewhere you might mean", the
+	// position says "how far away". Letting the position replace the country made
+	// results worse, because at a typical distance proximity is worth less than
+	// the flat country bonus; taking the larger of the two was no better, because
+	// the flat bonus then swamps proximity entirely and two towns in the caller's
+	// own country stop being distinguishable — which is most of what a position
+	// is for.
+	if opts.Home != "" || opts.Near != nil {
+		home := -1
+		if opts.Home != "" {
+			home = ix.countryIndex(opts.Home)
+		}
+		for i := range cands {
+			bonus := 0.0
+			if home >= 0 && ix.countryOf(cands[i].ord) == home {
+				bonus += HomeBonus
+			}
+			if opts.Near != nil {
+				if lat, lon, ok := ix.coordsOf(cands[i].ord); ok {
+					bonus += nearness(distanceKm(opts.Near.Lat, opts.Near.Lon, lat, lon))
 				}
 			}
+			cands[i].score += bonus
 		}
 	}
+
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].score != cands[j].score {
 			return cands[i].score > cands[j].score
@@ -317,6 +340,28 @@ func (ix *Index) eachEntry(src []byte, off uint64, fn func(ord uint32, score flo
 		}
 	}
 	return nil
+}
+
+// coordsOf decodes just far enough into a record to read its position.
+func (ix *Index) coordsOf(ord uint32) (lat, lon float64, ok bool) {
+	b, err := ix.recordAt(ord)
+	if err != nil {
+		return 0, 0, false
+	}
+	if _, w := binary.Uvarint(b); w > 0 { // id
+		b = b[w:]
+	} else {
+		return 0, 0, false
+	}
+	la, w1 := binary.Varint(b)
+	if w1 <= 0 {
+		return 0, 0, false
+	}
+	lo, w2 := binary.Varint(b[w1:])
+	if w2 <= 0 {
+		return 0, 0, false
+	}
+	return float64(la) / coordScale, float64(lo) / coordScale, true
 }
 
 // countryOf decodes just far enough into a record to read its country index.

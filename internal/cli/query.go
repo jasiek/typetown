@@ -23,6 +23,8 @@ func runQuery(env Env, args []string) error {
 		home     = fs.String("home", "", "ISO country code to bias results toward, e.g. US")
 		asJSON   = fs.Bool("json", false, "emit results as JSON")
 		pool     = fs.Int("pool", 2000, "candidates to consider before ranking")
+		lat      = fs.Float64("lat", 0, "latitude of the user, to rank nearby places higher")
+		lon      = fs.Float64("lon", 0, "longitude of the user; must accompany -lat")
 		interact = fs.Bool("i", false, "interactive mode: read queries from stdin")
 	)
 	fs.Usage = func() {
@@ -40,6 +42,22 @@ func runQuery(env Env, args []string) error {
 	defer ix.Close()
 
 	opts := index.SearchOptions{Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool}
+	// Coordinates supersede the country hint, so only take them when given.
+	latSet, lonSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "lat":
+			latSet = true
+		case "lon":
+			lonSet = true
+		}
+	})
+	if latSet != lonSet {
+		return fmt.Errorf("query: -lat and -lon must be given together")
+	}
+	if latSet {
+		opts.Near = &index.LatLon{Lat: *lat, Lon: *lon}
+	}
 
 	if *interact {
 		if fs.NArg() > 0 {

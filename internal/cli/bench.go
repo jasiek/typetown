@@ -17,22 +17,24 @@ import (
 // the case measures latency only, with it the case also measures accuracy.
 type benchCase struct {
 	query  string
-	want   int32  // 0 means "no expectation"
-	weight int    // how much this query matters; defaults to 1
-	home   string // country to bias toward for this case; "" uses the -home flag
+	want   int32         // 0 means "no expectation"
+	weight int           // how much this query matters; defaults to 1
+	home   string        // country to bias toward for this case; "" uses the -home flag
+	near   *index.LatLon // where the caller is; supersedes home when set
 }
 
 func runBench(env Env, args []string) error {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
 	var (
-		dir      = fs.String("index", "index", "index directory")
-		set      = fs.String("queries", "", "query set file (default: a built-in sample)")
-		limit    = fs.Int("limit", 10, "results to request per query")
-		home     = fs.String("home", "", "ISO country code to bias results toward")
-		pool     = fs.Int("pool", 2000, "candidates to consider before ranking")
-		repeat   = fs.Int("repeat", 1, "run the whole query set this many times")
-		prefixes = fs.String("prefixes", "", "also run truncations of each query at these lengths, e.g. 3,4,5")
+		dir        = fs.String("index", "index", "index directory")
+		set        = fs.String("queries", "", "query set file (default: a built-in sample)")
+		limit      = fs.Int("limit", 10, "results to request per query")
+		home       = fs.String("home", "", "ISO country code to bias results toward")
+		pool       = fs.Int("pool", 2000, "candidates to consider before ranking")
+		repeat     = fs.Int("repeat", 1, "run the whole query set this many times")
+		prefixes   = fs.String("prefixes", "", "also run truncations of each query at these lengths, e.g. 3,4,5")
+		ignoreNear = fs.Bool("ignore-near", false, "ignore any lat/lon in the query set, to measure what they are worth")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(env.Stderr, `usage: typetown bench [flags]
@@ -44,9 +46,11 @@ A query set is one case per line:
     <query>	<expected geonameid>
     <query>	<expected geonameid>	<weight>
     <query>	<expected geonameid>	<weight>	<home country>
+    <query>	<expected geonameid>	<weight>	<home country>	<lat>	<lon>
 
 A per-case home country overrides -home, so one query set can model traffic
-from several countries at their real proportions.
+from several countries at their real proportions. A per-case lat and lon model
+a caller whose position is known, and supersede the country.
 
 flags:
 `)
@@ -92,6 +96,9 @@ flags:
 			o := opts
 			if c.home != "" {
 				o.Home = c.home // the case knows where its user is
+			}
+			if c.near != nil && !*ignoreNear {
+				o.Near = c.near
 			}
 			start := time.Now()
 			res, err := ix.Search(c.query, o)
@@ -264,6 +271,14 @@ func loadQuerySet(path string) ([]benchCase, error) {
 		}
 		if len(cols) > 3 && cols[3] != "" {
 			c.home = strings.ToUpper(strings.TrimSpace(cols[3]))
+		}
+		if len(cols) > 5 && cols[4] != "" && cols[5] != "" {
+			lat, errLat := strconv.ParseFloat(cols[4], 64)
+			lon, errLon := strconv.ParseFloat(cols[5], 64)
+			if errLat != nil || errLon != nil {
+				return nil, fmt.Errorf("query set line %d: bad lat/lon %q,%q", line, cols[4], cols[5])
+			}
+			c.near = &index.LatLon{Lat: lat, Lon: lon}
 		}
 		cases = append(cases, c)
 	}

@@ -62,6 +62,12 @@ func (x *Index) Close() error {
 	return err
 }
 
+// LatLon is a point on the earth, in decimal degrees.
+type LatLon struct {
+	Lat float64
+	Lon float64
+}
+
 // SearchOptions tune a single query.
 type SearchOptions struct {
 	// Limit is how many results to return. Zero means ten.
@@ -70,6 +76,18 @@ type SearchOptions struct {
 	// no bias. It is a nudge, not an override: a nearby village will not displace
 	// a world city, but among comparable places the local one wins.
 	Home string
+	// Near is where the caller is. It separates two places within one country,
+	// which a country code cannot, and it gets the border case right: the nearest
+	// London to somebody in Detroit is the one in Ontario.
+	//
+	// It combines with Home rather than replacing it — whichever of the two helps
+	// a given place more is the one that counts — so setting both is safe and
+	// setting either can only improve the ranking.
+	//
+	// Like Home it is bounded, so a village down the road will not displace a
+	// capital. Its effect falls away logarithmically and reaches nothing at about
+	// a thousand kilometres.
+	Near *LatLon
 	// Pool caps how many candidates a scan gathers before ranking. Zero picks a
 	// sensible default. Raising it costs latency on short prefixes.
 	Pool int
@@ -110,8 +128,12 @@ func (x *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	if x == nil || x.ix == nil {
 		return nil, fmt.Errorf("typetown: index is closed")
 	}
+	var near *index.LatLon
+	if opts.Near != nil {
+		near = &index.LatLon{Lat: opts.Near.Lat, Lon: opts.Near.Lon}
+	}
 	hits, err := x.ix.Search(query, index.SearchOptions{
-		Limit: opts.Limit, Home: opts.Home, Pool: opts.Pool,
+		Limit: opts.Limit, Home: opts.Home, Near: near, Pool: opts.Pool,
 	})
 	if err != nil {
 		return nil, err
