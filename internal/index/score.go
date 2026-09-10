@@ -20,11 +20,16 @@ var featureBonus = map[string]float64{
 // bounded on purpose: a hard tier would bury Mumbai when someone types "bombay",
 // while no penalty at all lets a prominent city hijack an unrelated prefix
 // through an obscure alternate name.
+//
+// ClassHistoric is capped just above HomeBonus rather than at twice it. At 8.0,
+// a home-country bias was enough to put Bombay Beach, California (pop 295) above
+// Mumbai for the query "bombay" -- the two query-time bonuses have to stay small
+// relative to the penalties they interact with.
 var classPenalty = [4]float64{
 	geonames.ClassPrimary:   0.0,
 	geonames.ClassOfficial:  1.5,
 	geonames.ClassAlternate: 4.0,
-	geonames.ClassHistoric:  8.0,
+	geonames.ClassHistoric:  5.0,
 }
 
 // Prominence scores how likely a place is to be the one a user meant, using only

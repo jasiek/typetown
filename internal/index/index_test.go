@@ -66,7 +66,7 @@ func buildTestIndex(t *testing.T) *Index {
 		// Historical: must not be indexed at all.
 		dumpRow("6", "Lonesome Ghost Town", "Lonesome Ghost Town", "", "40.0", "-100.0", "PPLH", "US", "KS", "0"),
 		// Mumbai, to exercise an alternate name reaching a different record.
-		dumpRow("7", "Mumbai", "Mumbai", "मुंबई,ムンバイ", "19.07283", "72.88261", "PPLA", "IN", "16", "12691836"),
+		dumpRow("7", "Mumbai", "Mumbai", "मुंबई,ムンバイ,孟买,Мумбаи,Μουμπάι,ムンバイ,뭄바이,מומבאי,مومباي", "19.07283", "72.88261", "PPLA", "IN", "16", "12691836"),
 		// A tiny place literally named Bombay, which must lose to Mumbai.
 		dumpRow("8", "Bombay", "Bombay", "", "-37.18333", "174.96667", "PPL", "NZ", "E7", "740"),
 		// Two near-equal rivals in different countries, so the home bias has a
@@ -204,6 +204,27 @@ func TestHomeBiasIsBounded(t *testing.T) {
 	}
 	if d := scoreOf(biased, 1) - scoreOf(plain, 1); d != 0 {
 		t.Errorf("home bias moved the GB result by %v, want 0", d)
+	}
+}
+
+// The class penalties and the query-time bonuses have to stay in proportion to
+// each other. With the historic penalty at twice the home bonus, searching
+// "bombay" from the United States surfaced Bombay Beach, California (population
+// 295) above Mumbai.
+func TestHistoricNameOutranksTinyLocalHomonym(t *testing.T) {
+	ix := buildTestIndex(t)
+	for _, home := range []string{"", "NZ"} {
+		res, err := ix.Search("bombay", SearchOptions{Limit: 3, Home: home})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) == 0 || res[0].ID != 7 {
+			got := int32(0)
+			if len(res) > 0 {
+				got = res[0].ID
+			}
+			t.Errorf("Search(\"bombay\", home=%q) top result = %d, want Mumbai (7)", home, got)
+		}
 	}
 }
 
