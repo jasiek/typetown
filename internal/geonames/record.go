@@ -22,8 +22,6 @@ type Record struct {
 	FeatureCode string // PPL, PPLA, PPLC, ...
 	Lat, Lon    float64
 	Population  int64
-	Scripts     uint8 // distinct non-Latin writing systems among alternate names
-	AltCount    uint16
 }
 
 // Live reports whether a feature code denotes a place that still exists.

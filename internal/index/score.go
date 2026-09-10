@@ -6,9 +6,14 @@ import (
 	"typetown/internal/geonames"
 )
 
-// featureBonus is GeoNames' own statement of administrative importance,
-// expressed as a prominence bonus. It matters because population is zero for
-// ~91% of populated places, so it is often the only ranking signal present.
+// featureWeight scales the feature-code bonus below. It is small on purpose:
+// at full strength a national capital outranked a place with 100,000 more
+// residents, which measured worse in every country tested.
+const featureWeight = 0.25
+
+// featureBonus is GeoNames' own statement of administrative importance. It
+// breaks ties among places whose population is unrecorded, which is most of
+// them, but it is a tiebreak rather than a rival to population.
 var featureBonus = map[string]float64{
 	"PPLC": 5.0, "PPLA": 3.5, "PPLG": 3.0, "PPLCD": 3.0,
 	"PPLA2": 2.0, "PPLA3": 1.0, "PPLA4": 0.5, "PPLA5": 0.25,
@@ -25,20 +30,32 @@ var featureBonus = map[string]float64{
 // a home-country bias was enough to put Bombay Beach, California (pop 295) above
 // Mumbai for the query "bombay" -- the two query-time bonuses have to stay small
 // relative to the penalties they interact with.
+//
+// These are calibrated against the range Prominence actually spans, so they were
+// halved when that range was: penalties and bonuses sized for a 0-17 scale are
+// twice as forceful on a 0-9 one.
 var classPenalty = [4]float64{
 	geonames.ClassPrimary:   0.0,
-	geonames.ClassOfficial:  1.5,
-	geonames.ClassAlternate: 4.0,
-	geonames.ClassHistoric:  5.0,
+	geonames.ClassOfficial:  0.75,
+	geonames.ClassAlternate: 2.0,
+	geonames.ClassHistoric:  2.5,
 }
 
 // Prominence scores how likely a place is to be the one a user meant, using only
-// build-time facts. Three signals, in descending order of availability:
-// script diversity (34% of places), feature code (all of them), population (9%).
+// build-time facts.
+//
+// Population leads, despite being recorded for just 9% of populated places. The
+// availability statistic is a fact about the dataset, not about the queries: the
+// places people actually look up are the ones that have a population figure, and
+// the ones that do not are the tail nobody searches for.
+//
+// Measured against a query set weighted to real traffic across 24 countries,
+// population alone beat every combination tried, and adding the feature code at
+// a quarter weight beat population alone. A third signal -- how many writing
+// systems name the place -- was tried and removed: it lowered accuracy in all 24
+// countries, including the ones whose own script is not Latin.
 func Prominence(r *geonames.Record) float64 {
-	return math.Log10(float64(r.Population)+1) +
-		featureBonus[r.FeatureCode] +
-		1.5*math.Log10(float64(r.Scripts)+1)
+	return math.Log10(float64(r.Population)+1) + featureWeight*featureBonus[r.FeatureCode]
 }
 
 // EdgeScore is the score stored in a key's posting list: prominence, already
@@ -57,9 +74,10 @@ func EdgeScore(prominence float64, class geonames.Class) float64 {
 const (
 	// ExactBonus rewards a key the query matches in full, rather than merely
 	// prefixes: typing "york" should favour York over Yorkville.
-	ExactBonus = 1.0
+	ExactBonus = 0.5
 	// HomeBonus favours the caller's own country. Measured against a realistic
 	// query set this is the single largest ranking win available: for 3-character
-	// prefixes it lifts first-place accuracy from 19% to 56%.
-	HomeBonus = 4.0
+	// prefixes it lifts first-place accuracy from 19% to 56%. It must stay well
+	// under the span of Prominence, or a nearby village outranks a world city.
+	HomeBonus = 2.0
 )

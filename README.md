@@ -94,16 +94,25 @@ Every match is scored `prominence − classPenalty`, both fixed at build time so
 posting lists can be written pre-sorted and a query is a merge rather than a
 scan.
 
-**Prominence** combines three signals, in descending order of how often they are
-actually present:
+**Prominence** is population, plus the feature code at a quarter weight as a
+tiebreak.
 
-- **script diversity** — how many writing systems name the place. Present for
-  34% of places, and unlike a raw count of alternate names it is not fooled by
-  transliteration variance.
-- **feature code** — GeoNames' own statement of administrative rank: a national
-  capital outranks a county seat outranks a village.
-- **population** — the obvious signal, but it is zero for about 91% of populated
-  places, so it cannot carry the ranking alone.
+Population is recorded for only 9% of populated places, which looks like a
+reason not to lead with it — and was, until it was measured. That statistic
+describes the *dataset*, not the *queries*: the places people look up are the
+ones that have a population figure, and the ones that do not are the tail nobody
+searches for. Among the towns in the benchmark, population is present 88% of the
+time.
+
+The feature code — GeoNames' own statement of administrative rank — is what
+separates places whose population is unrecorded. It is deliberately scaled down:
+at full strength a national capital outranked a place with 100,000 more
+residents, which measured worse in every country tested.
+
+A third signal was tried and removed: how many writing systems name a place,
+which is a better proxy for international notability than a raw count of
+alternate names. It lowered accuracy in all 24 countries in the benchmark,
+including the ones whose own script is not Latin.
 
 **Class penalty** demotes matches reached through a lesser name — an official
 alternate, an ordinary alternate, a historic name. The penalties are bounded on

@@ -111,10 +111,6 @@ func ReadDump(path string, f Filter, fn func(*Record) error) error {
 		rec.Lon, _ = strconv.ParseFloat(cols[colLon], 64)
 		rec.Population, _ = strconv.ParseInt(cols[colPopulation], 10, 64)
 
-		alts := splitAlts(cols[colAltNames])
-		rec.AltCount = uint16(min(len(alts), 65535))
-		rec.Scripts = uint8(countScripts(alts))
-
 		if !f.keep(&rec) {
 			continue
 		}
@@ -126,11 +122,4 @@ func ReadDump(path string, f Filter, fn func(*Record) error) error {
 		return fmt.Errorf("read dump: %w", err)
 	}
 	return nil
-}
-
-func splitAlts(s string) []string {
-	if s == "" {
-		return nil
-	}
-	return strings.Split(s, ",")
 }
