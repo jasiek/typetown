@@ -8,6 +8,7 @@ Instructions for agents
 
 # Change process
 - Commit after every change.
+- Never include agent seession ids or references to them in commit messages.
 - Keep commits small and scoped to one functional fix/refactor when practical.
 
 # Validation
