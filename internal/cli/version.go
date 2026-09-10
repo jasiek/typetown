@@ -7,7 +7,7 @@ import (
 
 // version is stamped in at build time by the Makefile:
 //
-//	go build -ldflags "-X typetown/internal/cli.version=v1.2.3"
+//	go build -ldflags "-X github.com/jasiek/typetown/internal/cli.version=v1.2.3"
 //
 // When it is empty (plain `go build`, `go run`, `go install`) Version falls
 // back to the module and VCS metadata the toolchain embeds in every binary.

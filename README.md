@@ -352,6 +352,43 @@ Only the root package is public. Everything the library does not need to expose
 stays under `internal/`, so the on-disk format and the builder can change without
 breaking anyone.
 
+## Releasing
+
+Go has no publish step. A release is a git tag, and the module proxy fetches it
+from GitHub the first time somebody asks for it.
+
+```sh
+make ci                       # the tag should not ship if this is red
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+That is the whole release for consumers:
+
+```sh
+go get github.com/jasiek/typetown@v0.1.0
+go install github.com/jasiek/typetown/cmd/typetown@v0.1.0
+```
+
+Pushing the tag also triggers `.github/workflows/release.yml`, which runs the
+tests, cross-compiles for Linux, macOS and Windows on amd64 and arm64, and
+attaches the archives and their checksums to a GitHub Release. Those are a
+convenience for people without a Go toolchain; the tag alone is what makes
+`go install` work.
+
+Three things about tags are worth knowing before pushing one:
+
+- **A published tag is immutable.** `proxy.golang.org` caches its contents
+  permanently. Moving a tag does not change what anyone receives, and leaves
+  people whose checksum database disagrees with the new content unable to build.
+  Fix a bad release by tagging another one.
+- **A mistake is withdrawn with `retract`**, not by deleting the tag: add a
+  `retract v0.1.0` line to `go.mod` and tag `v0.1.1`. Existing users see a notice
+  rather than a broken build.
+- **`v2` and beyond change the import path.** The module path gains a `/v2`
+  suffix in `go.mod` and in every import. Until then `v0.x` says the API may
+  break between releases, which is honest while it is still settling.
+
 ## Development
 
 ```sh
