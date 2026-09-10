@@ -43,6 +43,7 @@ City for the query `new y`.
 ## Build
 
 ```sh
+make index                  # fetch the sources if needed, then build ./index
 make build                  # -> bin/typetown
 typetown build              # -> ./index, from ./sources
 typetown build -countries GB -out index-gb        # a fast subset for development

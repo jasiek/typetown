@@ -4,8 +4,11 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo deve
 LDFLAGS := -X github.com/jasiek/typetown/internal/cli.version=$(VERSION)
 
 GEONAMES := https://download.geonames.org/export/dump
+INDEX    := index
+SRCFILES := sources/allCountries.zip sources/alternateNamesV2.zip \
+            sources/admin1CodesASCII.txt sources/countryInfo.txt
 
-.PHONY: build run test lint tidy install clean sources ci
+.PHONY: build run test lint tidy install clean sources index ci
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BIN) $(CMD)
@@ -41,8 +44,7 @@ clean:
 
 # GeoNames inputs. Not tracked in git (see .gitignore); fetched on demand.
 # allCountries.zip is ~420 MB, so re-download only when it is missing.
-sources: sources/allCountries.zip sources/alternateNamesV2.zip \
-         sources/admin1CodesASCII.txt sources/countryInfo.txt
+sources: $(SRCFILES)
 
 sources/allCountries.zip:
 	mkdir -p sources
@@ -59,3 +61,15 @@ sources/admin1CodesASCII.txt:
 sources/countryInfo.txt:
 	mkdir -p sources
 	curl -fL -o $@ $(GEONAMES)/countryInfo.txt
+
+# Fetch whatever inputs are missing, then build an index with the default
+# options: every country, no population floor, alternate names included.
+# Expect this to take a few minutes and produce ~250 MB in $(INDEX)/.
+#
+# The rule hangs off manifest.json rather than the directory: make would
+# consider a directory target up to date the moment it exists, and the
+# manifest is the last file Build writes. Delete $(INDEX) to force a rebuild.
+index: $(INDEX)/manifest.json
+
+$(INDEX)/manifest.json: $(SRCFILES)
+	go run $(CMD) build -sources sources -out $(INDEX)
