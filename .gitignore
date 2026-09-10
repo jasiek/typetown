@@ -11,3 +11,9 @@ sources/
 # built indexes. The leading slash matters: a bare "index/" would also
 # match internal/index/, which is source.
 /index/
+
+# scratch copies made by the `make ci` module check
+.go.mod.ci
+.go.sum.ci
+go.mod.orig
+go.sum.orig

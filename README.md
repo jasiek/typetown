@@ -328,4 +328,11 @@ breaking anyone.
 make test   # go test ./...
 make lint   # go vet ./...
 make tidy   # go mod tidy
+make ci     # everything the CI workflow checks, including -race
 ```
+
+CI runs on Linux and macOS: build, vet, and the tests under the race detector.
+The race detector is not decoration here — the index is handed to `net/http` and
+searched from every request, so `Search` has to be safe under concurrency, and
+the first run of it found a shared `transform.Chain` in the name folder that was
+not.

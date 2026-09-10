@@ -3,11 +3,13 @@ package typetown_test
 import (
 	"archive/zip"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jasiek/typetown"
@@ -508,5 +510,85 @@ func TestHandlerNear(t *testing.T) {
 		if body.Error == "" {
 			t.Errorf("%s: no error message", bad)
 		}
+	}
+}
+
+// Search is documented as safe for concurrent use, which is the whole basis for
+// handing the index to net/http. Under -race this is what proves it.
+func TestSearchIsConcurrencySafe(t *testing.T) {
+	ix := openFixture(t)
+
+	queries := []string{"lond", "springfield", "wien", "singapore", "londr", "s", "zzz"}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(queries)*8)
+
+	for i := 0; i < 8; i++ {
+		for _, q := range queries {
+			wg.Add(1)
+			go func(q string) {
+				defer wg.Done()
+				for n := 0; n < 25; n++ {
+					opts := typetown.SearchOptions{Limit: 5, Home: "US"}
+					if n%2 == 0 {
+						opts.Near = &typetown.LatLon{Lat: 51.5, Lon: -0.12}
+					}
+					res, err := ix.Search(q, opts)
+					if err != nil {
+						errs <- err
+						return
+					}
+					// Results must stay internally consistent under concurrency.
+					for j := 1; j < len(res); j++ {
+						if res[j].Score > res[j-1].Score {
+							errs <- fmt.Errorf("query %q: results came back out of order", q)
+							return
+						}
+					}
+				}
+			}(q)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+// The handler is held by a mux and called from many connections at once.
+func TestHandlerIsConcurrencySafe(t *testing.T) {
+	srv := httptest.NewServer(typetown.Handler(openFixture(t), typetown.WithHome("GB")))
+	defer srv.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			url := srv.URL + "/?q=lond"
+			if i%2 == 0 {
+				url += "&lat=51.5&lon=-0.12"
+			}
+			res, err := http.Get(url)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer res.Body.Close()
+			var body response
+			if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+				errs <- err
+				return
+			}
+			if len(body.Results) == 0 {
+				errs <- fmt.Errorf("request %d came back empty", i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

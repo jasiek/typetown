@@ -5,7 +5,7 @@ LDFLAGS := -X github.com/jasiek/typetown/internal/cli.version=$(VERSION)
 
 GEONAMES := https://download.geonames.org/export/dump
 
-.PHONY: build run test lint tidy install clean sources
+.PHONY: build run test lint tidy install clean sources ci
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BIN) $(CMD)
@@ -18,6 +18,17 @@ test:
 
 lint:
 	go vet ./...
+
+# Everything CI checks, so a failure there can be reproduced in one command.
+ci:
+	go build ./...
+	go vet ./...
+	go test -race -count=1 ./...
+	@test -z "$$(gofmt -l .)" || { echo "needs gofmt:"; gofmt -l .; exit 1; }
+	@cp go.mod .go.mod.ci && cp go.sum .go.sum.ci && go mod tidy; \
+	  ok=1; cmp -s go.mod .go.mod.ci || ok=0; cmp -s go.sum .go.sum.ci || ok=0; \
+	  rm -f .go.mod.ci .go.sum.ci; \
+	  test $$ok -eq 1 || { echo "go mod tidy changed go.mod or go.sum; commit the result"; exit 1; }
 
 tidy:
 	go mod tidy

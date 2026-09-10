@@ -1,6 +1,9 @@
 package geonames
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestFold(t *testing.T) {
 	tests := []struct {
@@ -34,4 +37,30 @@ func TestFoldIsIdempotent(t *testing.T) {
 			t.Errorf("Fold(Fold(%q)) = %q, want %q", s, twice, once)
 		}
 	}
+}
+
+// Fold is called on every query, so an HTTP handler calls it from many
+// goroutines at once. A shared transform.Chain resets state on entry and races;
+// this is what catches that under -race.
+func TestFoldIsConcurrencySafe(t *testing.T) {
+	inputs := map[string]string{
+		"München": "munchen", "Zürich": "zurich", "Rāmpur": "rampur",
+		"São Paulo": "sao paulo", "Kraków": "krakow", "Ḩukūmat": "hukumat",
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				for in, want := range inputs {
+					if got := Fold(in); got != want {
+						t.Errorf("Fold(%q) = %q, want %q", in, got, want)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

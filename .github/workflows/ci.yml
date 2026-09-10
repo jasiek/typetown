@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is where this runs in production; macOS is where it is written.
+        # Both are worth covering, because the index is memory-mapped and the
+        # interactive query mode puts a terminal into raw mode.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race matters here: the index is handed to net/http and searched from
+      # every request, so Search has to be safe under concurrency. -count=1
+      # defeats the test cache, so a green run means the tests actually ran.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  tidy:
+    name: formatting and modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      # Compared against a copy rather than against git, so the check means
+      # exactly "tidy changes nothing" and does not depend on the tree being
+      # clean.
+      - name: go.mod and go.sum are current
+        run: |
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          go mod tidy
+          if ! cmp -s go.mod go.mod.orig || ! cmp -s go.sum go.sum.orig; then
+            echo "go mod tidy changed these; commit the result:"
+            diff -u go.mod.orig go.mod || true
+            diff -u go.sum.orig go.sum || true
+            exit 1
+          fi
