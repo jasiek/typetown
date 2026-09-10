@@ -17,8 +17,9 @@ import (
 // the case measures latency only, with it the case also measures accuracy.
 type benchCase struct {
 	query  string
-	want   int32 // 0 means "no expectation"
-	weight int   // how much this query matters; defaults to 1
+	want   int32  // 0 means "no expectation"
+	weight int    // how much this query matters; defaults to 1
+	home   string // country to bias toward for this case; "" uses the -home flag
 }
 
 func runBench(env Env, args []string) error {
@@ -42,6 +43,10 @@ A query set is one case per line:
     <query>
     <query>	<expected geonameid>
     <query>	<expected geonameid>	<weight>
+    <query>	<expected geonameid>	<weight>	<home country>
+
+A per-case home country overrides -home, so one query set can model traffic
+from several countries at their real proportions.
 
 flags:
 `)
@@ -72,20 +77,24 @@ flags:
 	defer ix.Close()
 	opts := index.SearchOptions{Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool}
 
+	// tally accumulates weighted hit counts, for the whole set and per country.
+	type tally struct{ total, h1, h3, h10 int }
 	var (
-		lat      []time.Duration
-		graded   int
-		wTotal   int
-		hit1     int
-		hit3     int
-		hit10    int
-		misses   []benchCase
-		emptyRes int
+		lat       []time.Duration
+		graded    int
+		all       tally
+		byCountry = map[string]*tally{}
+		misses    []benchCase
+		emptyRes  int
 	)
 	for r := 0; r < *repeat; r++ {
 		for _, c := range cases {
+			o := opts
+			if c.home != "" {
+				o.Home = c.home // the case knows where its user is
+			}
 			start := time.Now()
-			res, err := ix.Search(c.query, opts)
+			res, err := ix.Search(c.query, o)
 			lat = append(lat, time.Since(start))
 			if err != nil {
 				return err
@@ -97,7 +106,6 @@ flags:
 				continue
 			}
 			graded++
-			wTotal += c.weight
 			rank := 0
 			for i, x := range res {
 				if x.ID == c.want {
@@ -105,17 +113,28 @@ flags:
 					break
 				}
 			}
-			switch {
-			case rank == 1:
-				hit1 += c.weight
-				hit3 += c.weight
-				hit10 += c.weight
-			case rank > 0 && rank <= 3:
-				hit3 += c.weight
-				hit10 += c.weight
-			case rank > 0 && rank <= 10:
-				hit10 += c.weight
-			default:
+			key := c.home
+			if key == "" {
+				key = "—"
+			}
+			t := byCountry[key]
+			if t == nil {
+				t = &tally{}
+				byCountry[key] = t
+			}
+			for _, dst := range []*tally{&all, t} {
+				dst.total += c.weight
+				if rank == 1 {
+					dst.h1 += c.weight
+				}
+				if rank > 0 && rank <= 3 {
+					dst.h3 += c.weight
+				}
+				if rank > 0 && rank <= *limit {
+					dst.h10 += c.weight
+				}
+			}
+			if rank == 0 {
 				misses = append(misses, c)
 			}
 		}
@@ -133,10 +152,33 @@ flags:
 		round(total/time.Duration(len(lat))), round(pct(lat, 50)), round(pct(lat, 90)),
 		round(pct(lat, 99)), round(lat[len(lat)-1]))
 	if graded > 0 {
+		pc := func(n, d int) float64 {
+			if d == 0 {
+				return 0
+			}
+			return 100 * float64(n) / float64(d)
+		}
 		fmt.Fprintf(env.Stdout, "\naccuracy over %d graded cases (weighted)\n", graded)
-		fmt.Fprintf(env.Stdout, "  rank 1     %5.1f%%\n", 100*float64(hit1)/float64(wTotal))
-		fmt.Fprintf(env.Stdout, "  top 3      %5.1f%%\n", 100*float64(hit3)/float64(wTotal))
-		fmt.Fprintf(env.Stdout, "  top %-2d     %5.1f%%\n", *limit, 100*float64(hit10)/float64(wTotal))
+		fmt.Fprintf(env.Stdout, "  rank 1     %5.1f%%\n", pc(all.h1, all.total))
+		fmt.Fprintf(env.Stdout, "  top 3      %5.1f%%\n", pc(all.h3, all.total))
+		fmt.Fprintf(env.Stdout, "  top %-2d     %5.1f%%\n", *limit, pc(all.h10, all.total))
+
+		if len(byCountry) > 1 {
+			keys := make([]string, 0, len(byCountry))
+			for k := range byCountry {
+				keys = append(keys, k)
+			}
+			sort.Slice(keys, func(i, j int) bool {
+				return byCountry[keys[i]].total > byCountry[keys[j]].total
+			})
+			fmt.Fprintf(env.Stdout, "\n  by home country, heaviest first\n")
+			fmt.Fprintf(env.Stdout, "  %-6s %7s %8s %8s %8s\n", "home", "share", "rank 1", "top 3", "top "+strconv.Itoa(*limit))
+			for _, k := range keys {
+				t := byCountry[k]
+				fmt.Fprintf(env.Stdout, "  %-6s %6.1f%% %7.1f%% %7.1f%% %7.1f%%\n",
+					k, pc(t.total, all.total), pc(t.h1, t.total), pc(t.h3, t.total), pc(t.h10, t.total))
+			}
+		}
 		if len(misses) > 0 {
 			fmt.Fprintf(env.Stdout, "\n  %d cases outside the top %d, worst-weighted first:\n", len(misses), *limit)
 			sort.Slice(misses, func(i, j int) bool { return misses[i].weight > misses[j].weight })
@@ -220,6 +262,9 @@ func loadQuerySet(path string) ([]benchCase, error) {
 			}
 			c.weight = w
 		}
+		if len(cols) > 3 && cols[3] != "" {
+			c.home = strings.ToUpper(strings.TrimSpace(cols[3]))
+		}
 		cases = append(cases, c)
 	}
 	return cases, sc.Err()
@@ -247,7 +292,9 @@ func expandPrefixes(cases []benchCase, lens []int) []benchCase {
 		out = append(out, c)
 		for _, n := range lens {
 			if n < len(c.query) {
-				out = append(out, benchCase{query: c.query[:n], want: c.want, weight: c.weight})
+				short := c
+				short.query = c.query[:n]
+				out = append(out, short)
 			}
 		}
 	}
