@@ -15,14 +15,24 @@ import (
 
 // Index is an open, queryable index.
 type Index struct {
-	m        *Manifest
-	fst      *vellum.FST
-	postings []byte
-	records  []byte
-	offsets  []uint32
-
+	m       *Manifest
+	fst     *vellum.FST
 	hotFST  *vellum.FST
-	hotList []byte
+	mapped  []*mapping // everything to release on Close
+	records []byte
+	offsets []byte // little-endian uint32 per record, plus a trailing sentinel
+
+	postings []byte
+	hotList  []byte
+}
+
+// OpenOptions tunes how an index is brought into memory.
+type OpenOptions struct {
+	// NoMmap reads the index files onto the heap instead of mapping them. The
+	// default (mapping) is what lets replicas share one copy of the index; this
+	// exists for callers that would rather have a snapshot immune to the files
+	// being replaced underneath them.
+	NoMmap bool
 }
 
 // SearchOptions tunes a single query.
@@ -35,10 +45,11 @@ type SearchOptions struct {
 	Pool int
 }
 
-// Open loads an index directory. The FST is memory-mapped by vellum; postings
-// and records are read into memory, which for a planet-scale index is a few
-// hundred megabytes.
-func Open(dir string) (*Index, error) {
+// Open loads an index directory, mapping its files read-only.
+func Open(dir string) (*Index, error) { return OpenWith(dir, OpenOptions{}) }
+
+// OpenWith loads an index directory with explicit options.
+func OpenWith(dir string, opts OpenOptions) (ix *Index, err error) {
 	mf, err := os.ReadFile(filepath.Join(dir, manifestFile))
 	if err != nil {
 		return nil, fmt.Errorf("open index: %w", err)
@@ -50,61 +61,86 @@ func Open(dir string) (*Index, error) {
 	if m.Version != FormatVersion {
 		return nil, fmt.Errorf("index format v%d, this build reads v%d; rebuild the index", m.Version, FormatVersion)
 	}
-	fst, err := vellum.Open(filepath.Join(dir, fstFile))
-	if err != nil {
-		return nil, fmt.Errorf("open fst: %w", err)
+
+	idx := &Index{m: &m}
+	// Anything already acquired must be released if a later step fails, or the
+	// caller is left holding mappings it has no handle to.
+	defer func() {
+		if err != nil {
+			idx.Close()
+		}
+	}()
+
+	load := func(name string) ([]byte, error) {
+		mp, err := openMapping(filepath.Join(dir, name), !opts.NoMmap)
+		if err != nil {
+			return nil, err
+		}
+		idx.mapped = append(idx.mapped, mp)
+		return mp.data, nil
 	}
-	postings, err := os.ReadFile(filepath.Join(dir, postingsFile))
-	if err != nil {
-		return nil, fmt.Errorf("open postings: %w", err)
-	}
-	records, err := os.ReadFile(filepath.Join(dir, recordsFile))
-	if err != nil {
-		return nil, fmt.Errorf("open records: %w", err)
-	}
-	idx := &Index{m: &m, fst: fst, postings: postings, records: records}
-	if err := idx.buildOffsets(); err != nil {
+
+	if idx.records, err = load(recordsFile); err != nil {
 		return nil, err
 	}
-	idx.hotFST, err = vellum.Open(filepath.Join(dir, hotFSTFile))
-	if err != nil {
-		return nil, fmt.Errorf("open hot fst: %w", err)
+	if idx.offsets, err = load(recordsIdx); err != nil {
+		return nil, err
 	}
-	idx.hotList, err = os.ReadFile(filepath.Join(dir, hotFile))
-	if err != nil {
-		return nil, fmt.Errorf("open hot lists: %w", err)
+	if idx.postings, err = load(postingsFile); err != nil {
+		return nil, err
+	}
+	if idx.hotList, err = load(hotFile); err != nil {
+		return nil, err
+	}
+	if want := (m.Records + 1) * 4; len(idx.offsets) != want {
+		return nil, fmt.Errorf("%s is %d bytes, want %d for %d records", recordsIdx, len(idx.offsets), want, m.Records)
+	}
+
+	if idx.fst, err = vellum.Open(filepath.Join(dir, fstFile)); err != nil {
+		return nil, fmt.Errorf("open fst: %w", err)
+	}
+	if idx.hotFST, err = vellum.Open(filepath.Join(dir, hotFSTFile)); err != nil {
+		return nil, fmt.Errorf("open hot fst: %w", err)
 	}
 	return idx, nil
 }
 
-// buildOffsets walks records.bin once at open time to recover each record's
-// start. Storing an offset table on disk would trade 20 MB of file for this
-// ~100 ms scan; the scan wins because the file is read sequentially anyway.
-func (ix *Index) buildOffsets() error {
-	ix.offsets = make([]uint32, 0, ix.m.Records+1)
-	var p uint32
-	for i := 0; i < ix.m.Records; i++ {
-		ix.offsets = append(ix.offsets, p)
-		n, err := recordLen(ix.records[p:])
-		if err != nil {
-			return fmt.Errorf("record %d: %w", i, err)
-		}
-		p += uint32(n)
+// recordAt returns the encoded bytes of one record. Offsets are read straight
+// out of the mapped index, so opening never touches records.bin.
+func (ix *Index) recordAt(ord uint32) ([]byte, error) {
+	if int(ord)+1 >= len(ix.offsets)/4 {
+		return nil, fmt.Errorf("record ordinal %d out of range", ord)
 	}
-	ix.offsets = append(ix.offsets, p)
-	if int(p) != len(ix.records) {
-		return fmt.Errorf("records.bin: consumed %d of %d bytes", p, len(ix.records))
+	start := binary.LittleEndian.Uint32(ix.offsets[ord*4:])
+	end := binary.LittleEndian.Uint32(ix.offsets[(ord+1)*4:])
+	if start > end || int(end) > len(ix.records) {
+		return nil, fmt.Errorf("record %d spans [%d,%d) of %d bytes", ord, start, end, len(ix.records))
 	}
-	return nil
+	return ix.records[start:end], nil
 }
 
 func (ix *Index) Manifest() *Manifest { return ix.m }
 
+// Close releases the FSTs and unmaps every mapped file.
 func (ix *Index) Close() error {
-	err := ix.fst.Close()
-	if herr := ix.hotFST.Close(); err == nil {
-		err = herr
+	var err error
+	if ix.fst != nil {
+		err = ix.fst.Close()
+		ix.fst = nil
 	}
+	if ix.hotFST != nil {
+		if herr := ix.hotFST.Close(); err == nil {
+			err = herr
+		}
+		ix.hotFST = nil
+	}
+	for _, mp := range ix.mapped {
+		if merr := mp.Close(); err == nil {
+			err = merr
+		}
+	}
+	ix.mapped = nil
+	ix.records, ix.offsets, ix.postings, ix.hotList = nil, nil, nil, nil
 	return err
 }
 
@@ -285,7 +321,10 @@ func (ix *Index) eachEntry(src []byte, off uint64, fn func(ord uint32, score flo
 
 // countryOf decodes just far enough into a record to read its country index.
 func (ix *Index) countryOf(ord uint32) int {
-	b := ix.records[ix.offsets[ord]:ix.offsets[ord+1]]
+	b, err := ix.recordAt(ord)
+	if err != nil {
+		return -1
+	}
 	for i := 0; i < 5; i++ { // id, lat, lon, population, feature
 		_, w := binary.Uvarint(b)
 		if w <= 0 {
@@ -301,10 +340,10 @@ func (ix *Index) countryOf(ord uint32) int {
 }
 
 func (ix *Index) decode(ord uint32) (Result, error) {
-	if int(ord)+1 >= len(ix.offsets) {
-		return Result{}, fmt.Errorf("record ordinal %d out of range", ord)
+	b, err := ix.recordAt(ord)
+	if err != nil {
+		return Result{}, err
 	}
-	b := ix.records[ix.offsets[ord]:ix.offsets[ord+1]]
 	read := func() (uint64, error) {
 		v, w := binary.Uvarint(b)
 		if w <= 0 {
@@ -372,22 +411,6 @@ func (ix *Index) decode(ord uint32) (Result, error) {
 		res.Region = ix.m.Regions[reg]
 	}
 	return res, nil
-}
-
-// recordLen reports the encoded size of the record starting at b, by walking
-// its eight varint fields and adding the trailing name.
-func recordLen(b []byte) (int, error) {
-	p := 0
-	var namelen uint64
-	for i := 0; i < 8; i++ {
-		v, w := binary.Uvarint(b[p:])
-		if w <= 0 {
-			return 0, fmt.Errorf("truncated field %d", i)
-		}
-		p += w
-		namelen = v // the eighth and last field is the name length
-	}
-	return p + int(namelen), nil
 }
 
 // prefixSuccessor returns the exclusive upper bound of a prefix range: the

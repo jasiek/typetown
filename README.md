@@ -127,6 +127,20 @@ precomputes a ranked shortlist for every prefix with at least 500 keys beneath
 it — about 6,500 of them, 8 MB — and scans everything else exhaustively, which
 is cheap precisely because it is not hot.
 
+### Memory
+
+Index files are mapped read-only (`PROT_READ`, `MAP_SHARED`) rather than read
+onto the heap. Replicas sharing a volume then share one copy of the index in the
+host page cache no matter how many run, those pages are reclaimable under memory
+pressure instead of triggering an OOM kill, and the Go collector never has to
+size a heap around hundreds of megabytes it can never free. A single query
+process holds about 7 MB resident against a 266 MB index.
+
+The trade is that a mapping is a live view, not a snapshot: **replace an index by
+building into a new directory and swapping, never by overwriting files a reader
+may still hold open.** `OpenOptions{NoMmap: true}` reads instead, for callers who
+would rather have the snapshot.
+
 ## Layout
 
 ```

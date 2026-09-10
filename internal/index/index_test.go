@@ -50,6 +50,18 @@ func writeZip(t *testing.T, path, member, content string) {
 // builds an index from them.
 func buildTestIndex(t *testing.T) *Index {
 	t.Helper()
+	ix, err := Open(buildTestIndexDir(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	return ix
+}
+
+// buildTestIndexDir builds the fixture and returns its directory, so a test can
+// open it more than one way.
+func buildTestIndexDir(t *testing.T) string {
+	t.Helper()
 	dir := t.TempDir()
 
 	rows := []string{
@@ -118,12 +130,7 @@ func buildTestIndex(t *testing.T) *Index {
 	}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	ix, err := Open(out)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { ix.Close() })
-	return ix
+	return out
 }
 
 func TestSearch(t *testing.T) {
@@ -452,5 +459,80 @@ func TestHotPrefixStillHonoursExactMatch(t *testing.T) {
 			got = res[0].ID
 		}
 		t.Errorf("exact query %q top result = %d, want Loa (5)", "loa", got)
+	}
+}
+
+// Mapping the index must not change what it answers — it is a memory strategy,
+// not a different reader.
+func TestMappedAndHeapReadersAgree(t *testing.T) {
+	dir := buildTestIndexDir(t)
+
+	mapped, err := OpenWith(dir, OpenOptions{})
+	if err != nil {
+		t.Fatalf("open mapped: %v", err)
+	}
+	defer mapped.Close()
+
+	heap, err := OpenWith(dir, OpenOptions{NoMmap: true})
+	if err != nil {
+		t.Fatalf("open heap: %v", err)
+	}
+	defer heap.Close()
+
+	for _, q := range []string{"lond", "london", "rampur", "bombay", "singapore", "lo", "s"} {
+		for _, home := range []string{"", "US", "GB"} {
+			a, err := mapped.Search(q, SearchOptions{Limit: 8, Home: home})
+			if err != nil {
+				t.Fatalf("mapped search %q: %v", q, err)
+			}
+			b, err := heap.Search(q, SearchOptions{Limit: 8, Home: home})
+			if err != nil {
+				t.Fatalf("heap search %q: %v", q, err)
+			}
+			if len(a) != len(b) {
+				t.Errorf("query %q home %q: mapped %d results, heap %d", q, home, len(a), len(b))
+				continue
+			}
+			for i := range a {
+				if a[i] != b[i] {
+					t.Errorf("query %q home %q result %d: mapped %+v, heap %+v", q, home, i, a[i], b[i])
+				}
+			}
+		}
+	}
+}
+
+// Every record must be reachable through the stored offset table, including the
+// last one — an off-by-one in the sentinel would only ever show up there.
+func TestEveryRecordDecodes(t *testing.T) {
+	ix := buildTestIndex(t)
+	n := ix.Manifest().Records
+	if n == 0 {
+		t.Fatal("fixture has no records")
+	}
+	for ord := 0; ord < n; ord++ {
+		r, err := ix.decode(uint32(ord))
+		if err != nil {
+			t.Fatalf("decode(%d): %v", ord, err)
+		}
+		if r.Name == "" {
+			t.Errorf("record %d decoded with an empty name", ord)
+		}
+	}
+	if _, err := ix.decode(uint32(n)); err == nil {
+		t.Errorf("decode(%d) succeeded, want an out-of-range error", n)
+	}
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	ix, err := Open(buildTestIndexDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
 	}
 }

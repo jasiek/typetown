@@ -136,6 +136,32 @@ func (b *builder) writeRecords() error {
 	}
 	b.recOffsets = append(b.recOffsets, off) // sentinel: end of the last record
 	b.opts.Progress("records", len(b.recOffsets)-1)
+	return b.writeRecordIndex()
+}
+
+// writeRecordIndex stores where each record starts.
+//
+// The offsets could be recovered at open time by walking records.bin, and once
+// were. That is fine when the file is read onto the heap anyway, but it defeats
+// a memory map: the walk would fault in all 146 MB at startup, which is exactly
+// the cost mapping exists to avoid. 20 MB of file buys back a lazy open.
+func (b *builder) writeRecordIndex() error {
+	f, err := os.Create(filepath.Join(b.opts.OutDir, recordsIdx))
+	if err != nil {
+		return fmt.Errorf("create record index: %w", err)
+	}
+	defer f.Close()
+	w := bufio.NewWriterSize(f, 1<<20)
+	var buf [4]byte
+	for _, off := range b.recOffsets {
+		binary.LittleEndian.PutUint32(buf[:], off)
+		if _, err := w.Write(buf[:]); err != nil {
+			return fmt.Errorf("write record index: %w", err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush record index: %w", err)
+	}
 	return nil
 }
 

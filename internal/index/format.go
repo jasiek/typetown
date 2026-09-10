@@ -6,24 +6,27 @@
 //	names.fst      finite state transducer: folded name -> postings.bin offset
 //	postings.bin   per key, the matching records in descending score order
 //	records.bin    packed place records, addressed by ordinal
+//	records.idx    little-endian uint32 start of each record, plus a sentinel
 //	hot.fst        the prefixes with too many keys to scan -> hot.bin offset
 //	hot.bin        per hot prefix, a precomputed top-K in descending score order
 //
 // The split exists so that a query touches as little as possible: walking a
 // prefix reads only the FST, and only the handful of records that survive
-// ranking are ever decoded.
+// ranking are ever decoded. Every file is mapped read-only rather than read, so
+// replicas sharing a volume share one copy of the index in the page cache.
 package index
 
 const (
 	// FormatVersion is bumped whenever the on-disk encoding changes in a way a
 	// previously built index cannot survive. Readers refuse mismatches rather
 	// than misinterpreting bytes.
-	FormatVersion = 2
+	FormatVersion = 3
 
 	manifestFile = "manifest.json"
 	fstFile      = "names.fst"
 	postingsFile = "postings.bin"
 	recordsFile  = "records.bin"
+	recordsIdx   = "records.idx"
 	hotFSTFile   = "hot.fst"
 	hotFile      = "hot.bin"
 
