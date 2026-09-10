@@ -141,6 +141,93 @@ building into a new directory and swapping, never by overwriting files a reader
 may still hold open.** `OpenOptions{NoMmap: true}` reads instead, for callers who
 would rather have the snapshot.
 
+## The index on disk
+
+Seven files. A filled diamond means one structure contains the other; a dashed
+arrow is a pointer — a number stored in one file that addresses another. Every
+hop below is one of those numbers, so a query resolves by arithmetic rather than
+by scanning.
+
+```mermaid
+classDiagram
+    direction TB
+
+    class NamesFST {
+        <<names.fst — 5,532,766 entries>>
+        +bytes key
+        +uint64 value
+    }
+    class HotFST {
+        <<hot.fst — 6,489 entries>>
+        +bytes key
+        +uint64 value
+    }
+    class PostingList {
+        <<postings.bin — 5,532,766 lists>>
+        +uvarint count
+    }
+    class HotList {
+        <<hot.bin — 6,489 lists, count max 256>>
+        +uvarint count
+    }
+    class Posting {
+        <<9,300,117 in total>>
+        +uvarint ordinal
+        +varint score
+    }
+    class RecordsIdx {
+        <<records.idx — 5,165,451 slots>>
+        +uint32LE offset
+    }
+    class Record {
+        <<records.bin — 5,165,450 records>>
+        +uvarint id
+        +varint lat
+        +varint lon
+        +uvarint population
+        +uvarint featureIdx
+        +uvarint countryIdx
+        +uvarint regionIdx
+        +uvarint nameLen
+        +bytes name
+    }
+    class FeatureCodes {
+        <<manifest.featureCodes — 15>>
+        +string code
+    }
+    class Countries {
+        <<manifest.countries + countryNames — 248, parallel>>
+        +string cc
+        +string name
+    }
+    class Regions {
+        <<manifest.regions — 3,752, slot 0 = none>>
+        +string name
+    }
+
+    PostingList *-- "count" Posting : contains
+    HotList *-- "count" Posting : contains
+
+    NamesFST ..> PostingList : value = byte offset
+    HotFST ..> HotList : value = byte offset
+    Posting ..> RecordsIdx : ordinal = slot
+    RecordsIdx ..> Record : offset = first byte
+    Record ..> FeatureCodes : featureIdx
+    Record ..> Countries : countryIdx
+    Record ..> Regions : regionIdx
+```
+
+`names.fst` is walked for every query. `hot.fst` short-circuits the prefixes with
+too many keys beneath them to walk on a keystroke; both paths converge on record
+ordinals. Repeated strings — country, region, feature code — live once in
+`manifest.json` and are referenced by position, so "United Kingdom" is not
+written 250,000 times.
+
+`records.idx` exists because a record is variable-length: eight of its nine
+fields are varints, so there is no arithmetic path from an ordinal to a byte
+offset. Its extra trailing slot holds the file's length, which lets record `i`
+span `[offset[i], offset[i+1])` with no special case for the last one.
+
 ## Layout
 
 ```
@@ -149,11 +236,6 @@ internal/cli/       flag parsing, subcommand registry, usage
 internal/geonames/  parsing the dumps; name folding; script counting
 internal/index/     the on-disk format, the builder, and search
 ```
-
-An index directory holds four files: `manifest.json` (counts and the string
-tables records refer to by number), `names.fst` (the transducer, mapping a
-folded name to a postings offset), `postings.bin` (per key, the matching records
-in descending score order) and `records.bin` (the packed places).
 
 ## Development
 
