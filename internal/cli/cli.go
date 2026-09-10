@@ -53,6 +53,11 @@ var commands = []command{
 		run:     runQuery,
 	},
 	{
+		name:    "bench",
+		summary: "measure query latency and ranking accuracy",
+		run:     runBench,
+	},
+	{
 		name:    "version",
 		summary: "print the typetown version",
 		run:     runVersion,
