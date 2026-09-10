@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"typetown/internal/geonames"
-	"typetown/internal/index"
+	"github.com/jasiek/typetown/internal/geonames"
+	"github.com/jasiek/typetown/internal/index"
 )
 
 func runBuild(env Env, args []string) error {

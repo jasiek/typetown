@@ -3,7 +3,7 @@ package index
 import (
 	"math"
 
-	"typetown/internal/geonames"
+	"github.com/jasiek/typetown/internal/geonames"
 )
 
 // featureWeight scales the feature-code bonus below. It is small on purpose:

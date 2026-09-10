@@ -71,6 +71,64 @@ read -r town lat lon <<<"$(typetown query -i -home US)"
 When stdin is not a terminal there are no keystrokes to react to, so `-i` falls
 back to reading whole lines.
 
+## Use as a library
+
+Build the index with the command, then embed the query side. There is no server
+to run and no network hop: opening an index memory-maps it, and a lookup is tens
+of microseconds in your own process.
+
+```sh
+go get github.com/jasiek/typetown
+```
+
+```go
+ix, err := typetown.Open("/srv/typetown/index")
+if err != nil {
+	log.Fatal(err)
+}
+defer ix.Close()
+
+places, err := ix.Search("krak", typetown.SearchOptions{Limit: 5, Home: "PL"})
+// places[0] == {Name: "Kraków", Region: "Lesser Poland", Country: "Poland",
+//               CC: "PL", Lat: 50.06143, Lon: 19.93658, ...}
+```
+
+`Search` is safe for concurrent use. `Close` is not, and must not race with it.
+
+### A ready-to-attach endpoint
+
+`Handler` returns an `http.Handler` that answers lookups as JSON. It handles one
+route and does not care where you mount it:
+
+```go
+http.Handle("/places", typetown.Handler(ix,
+	typetown.WithHome("PL"),                    // bias when the request says nothing
+	typetown.WithHomeHeader("CF-IPCountry"),    // ...or take it from a trusted proxy
+	typetown.WithLimit(5, 20),                  // default and hard maximum
+	typetown.WithCORS("https://example.com"),   // omit for backend-only callers
+))
+```
+
+```
+GET /places?q=lond&limit=3&home=US
+
+{"query":"lond","results":[
+  {"id":2643743,"name":"London","region":"England","country":"United Kingdom",
+   "cc":"GB","lat":51.50853,"lon":-0.12573,"population":8961989,"kind":"PPLC","score":8.2},
+  {"id":4517009,"name":"London","region":"Ohio","country":"United States", ...},
+  {"id":4298960,"name":"London","region":"Kentucky","country":"United States", ...}]}
+```
+
+A missing `q` is 400 and a non-GET method is 405, but a query that matches
+nothing is 200 with an empty list — finding no such town is an answer, not an
+error. `limit` is clamped to the configured maximum, so one request cannot be
+made arbitrarily expensive. Successful responses carry `Cache-Control`, since an
+index is immutable once built.
+
+Set `WithHomeHeader` only where a trusted proxy sets the header: otherwise a
+client chooses its own bias. The consequence is mild — results come back in a
+different order — but it is still input from the network.
+
 ## Benchmark
 
 `bench` measures latency, and accuracy too when the query set says what each
@@ -240,11 +298,17 @@ span `[offset[i], offset[i+1])` with no special case for the last one.
 ## Layout
 
 ```
+typetown.go         the library: Open, Search, Result
+http.go             Handler, and the options that configure it
 cmd/typetown/       thin main(): wires stdio into the CLI and exits
 internal/cli/       flag parsing, subcommand registry, usage
-internal/geonames/  parsing the dumps; name folding; script counting
+internal/geonames/  parsing the dumps and folding names
 internal/index/     the on-disk format, the builder, and search
 ```
+
+Only the root package is public. Everything the library does not need to expose
+stays under `internal/`, so the on-disk format and the builder can change without
+breaking anyone.
 
 ## Development
 

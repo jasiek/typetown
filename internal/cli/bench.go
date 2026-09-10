@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"typetown/internal/index"
+	"github.com/jasiek/typetown/internal/index"
 )
 
 // benchCase is one line of a query set. The expected id is optional: without it

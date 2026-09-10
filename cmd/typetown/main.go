@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"typetown/internal/cli"
+	"github.com/jasiek/typetown/internal/cli"
 )
 
 func main() {

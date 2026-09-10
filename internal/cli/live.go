@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/term"
 
-	"typetown/internal/index"
+	"github.com/jasiek/typetown/internal/index"
 )
 
 // Control bytes we act on. Everything else printable is appended to the query.

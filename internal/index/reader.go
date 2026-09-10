@@ -10,7 +10,7 @@ import (
 
 	"github.com/blevesearch/vellum"
 
-	"typetown/internal/geonames"
+	"github.com/jasiek/typetown/internal/geonames"
 )
 
 // Index is an open, queryable index.

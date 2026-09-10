@@ -1,7 +1,7 @@
 BIN     := typetown
 CMD     := ./cmd/typetown
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo devel)
-LDFLAGS := -X typetown/internal/cli.version=$(VERSION)
+LDFLAGS := -X github.com/jasiek/typetown/internal/cli.version=$(VERSION)
 
 GEONAMES := https://download.geonames.org/export/dump
 

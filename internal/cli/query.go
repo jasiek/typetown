@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/term"
 
-	"typetown/internal/index"
+	"github.com/jasiek/typetown/internal/index"
 )
 
 func runQuery(env Env, args []string) error {

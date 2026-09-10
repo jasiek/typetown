@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"typetown/internal/geonames"
+	"github.com/jasiek/typetown/internal/geonames"
 )
 
 // dumpRow builds one tab-separated line of the geoname table. Only the columns

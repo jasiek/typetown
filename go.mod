@@ -1,4 +1,4 @@
-module typetown
+module github.com/jasiek/typetown
 
 go 1.27.1
 
