@@ -1,32 +1,41 @@
 name: Index
 
-# Builds the full world index and attaches it as a downloadable artifact, so
-# that people who want the index do not have to fetch 625 MB from GeoNames and
-# spend a few minutes of CPU on it themselves.
+# Builds the full world index and publishes it as a release asset, so that
+# people who want the index do not have to fetch 625 MB from GeoNames and spend
+# a few minutes of CPU on it themselves.
+#
+# It is a release rather than a workflow artifact because an artifact is only a
+# download for somebody logged in to GitHub, expires after 90 days, and has no
+# stable URL. A release asset is anonymously downloadable, permanent, and always
+# at the same address.
 #
 # Run it from the Actions tab. Building takes long enough that it is not worth
 # repeating for an index that would come out the same, so the run first works
 # out what the result depends on — the upstream data and the code that turns it
-# into an index — and skips the build when an artifact for exactly that pair
-# already exists. Adding a `schedule:` here would then be cheap: the no-op path
-# is four HEAD requests.
+# into an index — and stops when what is published already matches. Adding a
+# `schedule:` here would then be cheap: the no-op path is four HEAD requests.
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild even if an artifact for the current data and builder already exists"
+        description: "Rebuild even if the published index is already current"
         type: boolean
         default: false
 
 permissions:
-  contents: read
-  actions: read # to look for an artifact from an earlier run
+  contents: write # to publish the index as a release asset
 
 # One index build at a time. Not cancel-in-progress: a run this long that is
 # already past the download should be allowed to finish.
 concurrency:
   group: index
   cancel-in-progress: false
+
+env:
+  # A tag that never moves and a filename that never changes, because together
+  # they are the download URL, which is the point of publishing this way.
+  TAG: index-latest
+  ASSET: typetown-index.zip
 
 jobs:
   build:
@@ -41,10 +50,10 @@ jobs:
           check-latest: true
 
       # Half of what the index depends on. Without this an index built by an
-      # older commit would be handed back after a change to the parser, the
+      # older commit would be left published after a change to the parser, the
       # ranking or the on-disk format, since none of those move the dump sizes
       # the other half of the key is made of — and a FormatVersion bump would
-      # leave that artifact rejected outright by the reader.
+      # leave that index rejected outright by the reader.
       #
       # Hashing the packages that produce an index rather than the commit means
       # a README or serve-side change does not cost a rebuild. Test files are
@@ -103,106 +112,168 @@ jobs:
           cat "$RUNNER_TEMP/upstream.txt"
           fp=$(sha256sum "$RUNNER_TEMP/sizes.txt" | cut -c1-8)
           echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
-          echo "artifact=typetown-index-$fp-$CODE_FP" >> "$GITHUB_OUTPUT"
+          echo "key=$fp-$CODE_FP" >> "$GITHUB_OUTPUT"
 
-      # The artifact is the state: if one built from this same data by this same
-      # code is still around, this run has nothing to do. Artifacts expire, and
-      # an expired one is not a download, so those do not count.
-      - name: Look for an existing artifact
-        id: existing
+      # The published index is the state. SOURCES.txt ships beside the archive
+      # precisely so this can be answered by reading a few hundred bytes rather
+      # than the 250 MB it describes.
+      - name: Compare with what is published
+        id: published
         env:
           GH_TOKEN: ${{ github.token }}
-          NAME: ${{ steps.upstream.outputs.artifact }}
+          KEY: ${{ steps.upstream.outputs.key }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
           if [ "$FORCE" = "true" ]; then
             echo "forced; building regardless"
-            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "current=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          n=$(gh api -X GET "/repos/$GITHUB_REPOSITORY/actions/artifacts" \
-                -f name="$NAME" -f per_page=100 \
-                --jq '[.artifacts[] | select(.expired == false)] | length')
-          echo "$n live artifacts named $NAME"
-          if [ "$n" -gt 0 ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
+          dir="$RUNNER_TEMP/published"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          # Absent for the very first run, and for a release whose assets were
+          # removed by hand; both mean there is nothing current to match.
+          gh release download "$TAG" --pattern SOURCES.txt --dir "$dir" || true
+          have=$(sed -n 's/^key:[[:space:]]*//p' "$dir/SOURCES.txt" 2>/dev/null || true)
+          echo "published: ${have:-none}"
+          echo "computed:  $KEY"
+          if [ "$have" = "$KEY" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
           else
-            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "current=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Fetch the sources
-        if: steps.existing.outputs.found != 'true'
+        if: steps.published.outputs.current != 'true'
         run: make sources
 
       - name: Build the index
-        if: steps.existing.outputs.found != 'true'
+        if: steps.published.outputs.current != 'true'
         run: make index
 
-      # An index that cannot answer a query is not worth uploading, and the
+      # An index that cannot answer a query is not worth publishing, and the
       # build is far too long to discover that from a bug report.
       - name: Smoke-test the index
-        if: steps.existing.outputs.found != 'true'
+        if: steps.published.outputs.current != 'true'
         run: |
           set -euo pipefail
           out=$(go run ./cmd/typetown query -index index -json -limit 3 london)
           echo "$out"
           echo "$out" | grep -qi london
 
-      # Recorded inside the artifact so a downloaded index can be traced back to
-      # the data and the code it came from.
-      - name: Record the provenance in the artifact
-        if: steps.existing.outputs.found != 'true'
+      # SOURCES.txt goes both inside the archive, so a downloaded index can be
+      # traced back to where it came from, and beside it, so the next run can
+      # read the key without downloading the index.
+      - name: Package the index
+        if: steps.published.outputs.current != 'true'
         env:
+          KEY: ${{ steps.upstream.outputs.key }}
           DATA_FP: ${{ steps.upstream.outputs.fingerprint }}
           CODE_FP: ${{ steps.code.outputs.fingerprint }}
         run: |
           set -euo pipefail
           {
             echo "typetown index"
+            echo "key:     $KEY"
+            echo "data:    $DATA_FP"
+            echo "builder: $CODE_FP"
             echo "built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "commit:  $GITHUB_SHA"
             echo "run:     $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "data:    $DATA_FP"
-            echo "builder: $CODE_FP"
             echo
             echo "upstream (as reported by download.geonames.org):"
             sed 's/^/  /' "$RUNNER_TEMP/upstream.txt"
           } > index/SOURCES.txt
           cat index/SOURCES.txt
+          cp index/SOURCES.txt "$RUNNER_TEMP/SOURCES.txt"
 
-      - name: Upload the index
-        id: upload
-        if: steps.existing.outputs.found != 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.upstream.outputs.artifact }}
-          path: index
-          retention-days: 90
-          if-no-files-found: error
-          # The index is mostly binary and already compact; squeezing it harder
-          # costs minutes of CPU for very little.
-          compression-level: 1
+          # Archived with the directory, so unzipping gives an index/ to point
+          # -index at rather than seven files in the current directory.
+          zip -qr "$RUNNER_TEMP/$ASSET" index
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET" > "$ASSET.sha256")
+          ls -la "$RUNNER_TEMP/$ASSET" "$RUNNER_TEMP/$ASSET.sha256"
+
+      # The release is regenerated in place: same tag, same filenames, so the
+      # download URL in the README keeps working. Marked a pre-release so it
+      # never takes the "Latest release" slot from the v* tags, which are what
+      # `go install` follows.
+      - name: Publish the release
+        id: publish
+        if: steps.published.outputs.current != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.upstream.outputs.key }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
+          sha=$(cut -d' ' -f1 "$RUNNER_TEMP/$ASSET.sha256")
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "The whole world, ready to unzip and point typetown at."
+            echo
+            echo '```sh'
+            echo "curl -fLO $url"
+            echo "unzip $ASSET"
+            echo "typetown serve -index index"
+            echo '```'
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| built | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| run | $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID |"
+            echo "| key | \`$KEY\` |"
+            echo "| sha256 | \`$sha\` |"
+            echo
+            echo "This release is regenerated in place whenever the GeoNames data or the"
+            echo "index builder changes, so the URL above always serves the current index."
+            echo "The \`$TAG\` tag is a fixed anchor for that URL; the commit the asset was"
+            echo "built from is the one in the table, and in the SOURCES.txt inside."
+            echo
+            echo "Upstream:"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/upstream.txt"
+            echo '```'
+          } > "$notes"
+
+          title="World index ($(date -u +%Y-%m-%d))"
+          assets="$RUNNER_TEMP/$ASSET $RUNNER_TEMP/$ASSET.sha256 $RUNNER_TEMP/SOURCES.txt"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title" --notes-file "$notes" --prerelease
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" $assets --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" $assets \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --prerelease
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         if: always()
         env:
-          NAME: ${{ steps.upstream.outputs.artifact }}
-          FOUND: ${{ steps.existing.outputs.found }}
-          URL: ${{ steps.upload.outputs.artifact-url }}
+          KEY: ${{ steps.upstream.outputs.key }}
+          CURRENT: ${{ steps.published.outputs.current }}
+          URL: ${{ steps.publish.outputs.url }}
         run: |
           {
             echo "### Index"
             echo
-            echo "Data \`${{ steps.upstream.outputs.fingerprint || 'unknown' }}\`, builder \`${{ steps.code.outputs.fingerprint || 'unknown' }}\`."
+            echo "Key \`${KEY:-unknown}\` (data, then builder)."
             echo
-            if [ "$FOUND" = "true" ]; then
-              echo "Neither the upstream data nor the builder has changed since \`$NAME\` was built, so nothing was rebuilt."
+            if [ "$CURRENT" = "true" ]; then
+              echo "The published index is already built from this data by this builder, so nothing was rebuilt."
               echo "Re-run with **force** to build it again anyway."
             elif [ -n "$URL" ]; then
-              echo "Built and uploaded as [\`$NAME\`]($URL)."
+              echo "Published: $URL"
             else
-              echo "No artifact was produced; see the failing step above."
+              echo "Nothing was published; see the failing step above."
             fi
             if [ -s "$RUNNER_TEMP/upstream.txt" ]; then
               echo
