@@ -50,6 +50,32 @@ typetown build -countries GB -out index-gb        # a fast subset for developmen
 typetown build -min-population 1000               # smaller index, fewer hamlets
 ```
 
+### A prebuilt index from CI
+
+`.github/workflows/index.yml` builds the whole-world index and attaches it to
+the run as a downloadable artifact, for anyone who would rather not spend
+625 MB and a few minutes of CPU on it. Start it from the **Actions** tab →
+**Index** → **Run workflow**.
+
+The run asks `download.geonames.org` for the size of each input before doing
+anything else, and skips the build when an artifact built from exactly those
+sizes is still around; running it again on unchanged data therefore costs four
+HEAD requests. Tick **force** to rebuild regardless. Size, rather than
+`Last-Modified`, is what the fingerprint covers: the dumps are regenerated
+nightly whether or not the data moved, and re-zipping unchanged rows produces
+the same number of bytes.
+
+Artifacts are named `typetown-index-<fingerprint>` and expire after 90 days.
+Unzip one and point the commands at it:
+
+```sh
+typetown query -index path/to/index london
+typetown serve -index path/to/index
+```
+
+`SOURCES.txt` inside records the commit and the upstream files it was built
+from, so a downloaded index can be traced back to its data.
+
 ## Query
 
 ```sh
