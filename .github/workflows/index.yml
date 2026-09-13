@@ -5,15 +5,16 @@ name: Index
 # spend a few minutes of CPU on it themselves.
 #
 # Run it from the Actions tab. Building takes long enough that it is not worth
-# repeating for data that has not moved, so the run first asks GeoNames what it
-# is serving and skips the build when an artifact for exactly that data already
-# exists. Adding a `schedule:` here would then be cheap: the no-op path is four
-# HEAD requests.
+# repeating for an index that would come out the same, so the run first works
+# out what the result depends on — the upstream data and the code that turns it
+# into an index — and skips the build when an artifact for exactly that pair
+# already exists. Adding a `schedule:` here would then be cheap: the no-op path
+# is four HEAD requests.
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild even if an artifact for the current upstream data already exists"
+        description: "Rebuild even if an artifact for the current data and builder already exists"
         type: boolean
         default: false
 
@@ -39,14 +40,39 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      # Four HEAD requests, rather than 625 MB, to find out what GeoNames is
-      # serving. The fingerprint is over Content-Length alone: the dumps are
-      # regenerated every day, so Last-Modified moves whether or not anything
-      # changed, while the size only moves when the data does — a re-zip of
-      # unchanged rows is byte-for-byte the same length. Last-Modified is still
-      # recorded, for people reading the run rather than for the decision.
+      # Half of what the index depends on. Without this an index built by an
+      # older commit would be handed back after a change to the parser, the
+      # ranking or the on-disk format, since none of those move the dump sizes
+      # the other half of the key is made of — and a FormatVersion bump would
+      # leave that artifact rejected outright by the reader.
+      #
+      # Hashing the packages that produce an index rather than the commit means
+      # a README or serve-side change does not cost a rebuild. Test files are
+      # left out for the same reason: they cannot change what Build writes.
+      - name: Fingerprint the builder
+        id: code
+        run: |
+          set -euo pipefail
+          files=$({ git ls-files 'internal/index/*.go' 'internal/geonames/*.go' \
+                      internal/cli/build.go go.mod go.sum \
+                    | grep -v '_test\.go$'; } || true)
+          test -n "$files" || { echo "no builder sources matched"; exit 1; }
+          echo "$files"
+          fp=$(echo "$files" | xargs sha256sum | sha256sum | cut -c1-8)
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+
+      # The other half, in four HEAD requests rather than 625 MB. Content-Length
+      # is what the fingerprint covers, because the dumps are regenerated every
+      # night whether or not anything changed: Last-Modified therefore always
+      # moves, and so does the ETag, which Apache builds out of the size and the
+      # mtime ("7bbe-65b544b954a27"). Size is the only header here that tracks
+      # the data — re-zipping unchanged rows produces the same number of bytes.
+      # It is not a checksum, so two different dumps of identical length would
+      # be missed; `force` is the way out of that.
       - name: Fingerprint the upstream data
         id: upstream
+        env:
+          CODE_FP: ${{ steps.code.outputs.fingerprint }}
         run: |
           set -euo pipefail
           base=$(sed -n 's/^GEONAMES[[:space:]]*:=[[:space:]]*//p' Makefile)
@@ -55,27 +81,33 @@ jobs:
           : > "$RUNNER_TEMP/upstream.txt"
           : > "$RUNNER_TEMP/sizes.txt"
           for f in allCountries.zip alternateNamesV2.zip admin1CodesASCII.txt countryInfo.txt; do
-            headers=$(curl -fsSIL --retry 3 --retry-delay 5 "$base/$f" \
-              | tr -d '\r' \
+            # Kept apart from the parsing below so that a failed HEAD stops the
+            # run here, rather than being read as a file that reports nothing.
+            raw=$(curl -fsSIL --retry 3 --retry-delay 5 "$base/$f") \
+              || { echo "HEAD $base/$f failed"; exit 1; }
+            headers=$(printf '%s\n' "$raw" | tr -d '\r' \
               | grep -iE '^(last-modified|content-length):' \
-              | tr 'A-Z' 'a-z' \
-              | sort) || true
-            size=$(printf '%s\n' "$headers" | sed -n 's/^content-length:[[:space:]]*//p')
+              | tr 'A-Z' 'a-z' | sort) || true
+            # -L can leave more than one response in $raw; the last one is the
+            # file itself.
+            size=$(printf '%s\n' "$headers" | sed -n 's/^content-length:[[:space:]]*//p' | tail -n 1)
             # Without a size there is nothing to compare, and silently
             # fingerprinting nothing would mean never rebuilding again.
-            test -n "$size" || { echo "$base/$f served no content-length"; exit 1; }
+            case "$size" in
+              "" | *[!0-9]*) echo "$base/$f served no usable content-length"; exit 1 ;;
+            esac
             printf '%s %s\n' "$f" "$size" >> "$RUNNER_TEMP/sizes.txt"
             printf '%s\n%s\n' "$f" "$headers" >> "$RUNNER_TEMP/upstream.txt"
           done
 
           cat "$RUNNER_TEMP/upstream.txt"
-          fp=$(sha256sum "$RUNNER_TEMP/sizes.txt" | cut -c1-12)
+          fp=$(sha256sum "$RUNNER_TEMP/sizes.txt" | cut -c1-8)
           echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
-          echo "artifact=typetown-index-$fp" >> "$GITHUB_OUTPUT"
+          echo "artifact=typetown-index-$fp-$CODE_FP" >> "$GITHUB_OUTPUT"
 
-      # The artifact is the state: if one built from this same upstream data is
-      # still around, this run has nothing to do. Artifacts expire, and an
-      # expired one is not a download, so those do not count.
+      # The artifact is the state: if one built from this same data by this same
+      # code is still around, this run has nothing to do. Artifacts expire, and
+      # an expired one is not a download, so those do not count.
       - name: Look for an existing artifact
         id: existing
         env:
@@ -118,16 +150,21 @@ jobs:
           echo "$out" | grep -qi london
 
       # Recorded inside the artifact so a downloaded index can be traced back to
-      # the data it was built from.
-      - name: Record the upstream data in the artifact
+      # the data and the code it came from.
+      - name: Record the provenance in the artifact
         if: steps.existing.outputs.found != 'true'
+        env:
+          DATA_FP: ${{ steps.upstream.outputs.fingerprint }}
+          CODE_FP: ${{ steps.code.outputs.fingerprint }}
         run: |
           set -euo pipefail
           {
             echo "typetown index"
-            echo "built:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "commit:      $GITHUB_SHA"
-            echo "fingerprint: ${{ steps.upstream.outputs.fingerprint }}"
+            echo "built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit:  $GITHUB_SHA"
+            echo "run:     $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "data:    $DATA_FP"
+            echo "builder: $CODE_FP"
             echo
             echo "upstream (as reported by download.geonames.org):"
             sed 's/^/  /' "$RUNNER_TEMP/upstream.txt"
@@ -150,7 +187,6 @@ jobs:
       - name: Summary
         if: always()
         env:
-          FP: ${{ steps.upstream.outputs.fingerprint }}
           NAME: ${{ steps.upstream.outputs.artifact }}
           FOUND: ${{ steps.existing.outputs.found }}
           URL: ${{ steps.upload.outputs.artifact-url }}
@@ -158,10 +194,10 @@ jobs:
           {
             echo "### Index"
             echo
-            echo "Upstream fingerprint: \`${FP:-unknown}\`"
+            echo "Data \`${{ steps.upstream.outputs.fingerprint || 'unknown' }}\`, builder \`${{ steps.code.outputs.fingerprint || 'unknown' }}\`."
             echo
             if [ "$FOUND" = "true" ]; then
-              echo "The upstream data has not changed since \`$NAME\` was built, so nothing was rebuilt."
+              echo "Neither the upstream data nor the builder has changed since \`$NAME\` was built, so nothing was rebuilt."
               echo "Re-run with **force** to build it again anyway."
             elif [ -n "$URL" ]; then
               echo "Built and uploaded as [\`$NAME\`]($URL)."
