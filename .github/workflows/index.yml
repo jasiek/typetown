@@ -1,0 +1,213 @@
+name: Index
+
+# Builds the full world index and attaches it as a downloadable artifact, so
+# that people who want the index do not have to fetch 625 MB from GeoNames and
+# spend a few minutes of CPU on it themselves.
+#
+# Run it from the Actions tab. Building takes long enough that it is not worth
+# repeating for an index that would come out the same, so the run first works
+# out what the result depends on — the upstream data and the code that turns it
+# into an index — and skips the build when an artifact for exactly that pair
+# already exists. Adding a `schedule:` here would then be cheap: the no-op path
+# is four HEAD requests.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if an artifact for the current data and builder already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read # to look for an artifact from an earlier run
+
+# One index build at a time. Not cancel-in-progress: a run this long that is
+# already past the download should be allowed to finish.
+concurrency:
+  group: index
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Half of what the index depends on. Without this an index built by an
+      # older commit would be handed back after a change to the parser, the
+      # ranking or the on-disk format, since none of those move the dump sizes
+      # the other half of the key is made of — and a FormatVersion bump would
+      # leave that artifact rejected outright by the reader.
+      #
+      # Hashing the packages that produce an index rather than the commit means
+      # a README or serve-side change does not cost a rebuild. Test files are
+      # left out for the same reason: they cannot change what Build writes.
+      - name: Fingerprint the builder
+        id: code
+        run: |
+          set -euo pipefail
+          files=$({ git ls-files 'internal/index/*.go' 'internal/geonames/*.go' \
+                      internal/cli/build.go go.mod go.sum \
+                    | grep -v '_test\.go$'; } || true)
+          test -n "$files" || { echo "no builder sources matched"; exit 1; }
+          echo "$files"
+          fp=$(echo "$files" | xargs sha256sum | sha256sum | cut -c1-8)
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+
+      # The other half, in four HEAD requests rather than 625 MB. Content-Length
+      # is what the fingerprint covers, because the dumps are regenerated every
+      # night whether or not anything changed: Last-Modified therefore always
+      # moves, and so does the ETag, which Apache builds out of the size and the
+      # mtime ("7bbe-65b544b954a27"). Size is the only header here that tracks
+      # the data — re-zipping unchanged rows produces the same number of bytes.
+      # It is not a checksum, so two different dumps of identical length would
+      # be missed; `force` is the way out of that.
+      - name: Fingerprint the upstream data
+        id: upstream
+        env:
+          CODE_FP: ${{ steps.code.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^GEONAMES[[:space:]]*:=[[:space:]]*//p' Makefile)
+          test -n "$base" || { echo "no GEONAMES URL in the Makefile"; exit 1; }
+
+          : > "$RUNNER_TEMP/upstream.txt"
+          : > "$RUNNER_TEMP/sizes.txt"
+          for f in allCountries.zip alternateNamesV2.zip admin1CodesASCII.txt countryInfo.txt; do
+            # Kept apart from the parsing below so that a failed HEAD stops the
+            # run here, rather than being read as a file that reports nothing.
+            raw=$(curl -fsSIL --retry 3 --retry-delay 5 "$base/$f") \
+              || { echo "HEAD $base/$f failed"; exit 1; }
+            headers=$(printf '%s\n' "$raw" | tr -d '\r' \
+              | grep -iE '^(last-modified|content-length):' \
+              | tr 'A-Z' 'a-z' | sort) || true
+            # -L can leave more than one response in $raw; the last one is the
+            # file itself.
+            size=$(printf '%s\n' "$headers" | sed -n 's/^content-length:[[:space:]]*//p' | tail -n 1)
+            # Without a size there is nothing to compare, and silently
+            # fingerprinting nothing would mean never rebuilding again.
+            case "$size" in
+              "" | *[!0-9]*) echo "$base/$f served no usable content-length"; exit 1 ;;
+            esac
+            printf '%s %s\n' "$f" "$size" >> "$RUNNER_TEMP/sizes.txt"
+            printf '%s\n%s\n' "$f" "$headers" >> "$RUNNER_TEMP/upstream.txt"
+          done
+
+          cat "$RUNNER_TEMP/upstream.txt"
+          fp=$(sha256sum "$RUNNER_TEMP/sizes.txt" | cut -c1-8)
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+          echo "artifact=typetown-index-$fp-$CODE_FP" >> "$GITHUB_OUTPUT"
+
+      # The artifact is the state: if one built from this same data by this same
+      # code is still around, this run has nothing to do. Artifacts expire, and
+      # an expired one is not a download, so those do not count.
+      - name: Look for an existing artifact
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.upstream.outputs.artifact }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE" = "true" ]; then
+            echo "forced; building regardless"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          n=$(gh api -X GET "/repos/$GITHUB_REPOSITORY/actions/artifacts" \
+                -f name="$NAME" -f per_page=100 \
+                --jq '[.artifacts[] | select(.expired == false)] | length')
+          echo "$n live artifacts named $NAME"
+          if [ "$n" -gt 0 ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch the sources
+        if: steps.existing.outputs.found != 'true'
+        run: make sources
+
+      - name: Build the index
+        if: steps.existing.outputs.found != 'true'
+        run: make index
+
+      # An index that cannot answer a query is not worth uploading, and the
+      # build is far too long to discover that from a bug report.
+      - name: Smoke-test the index
+        if: steps.existing.outputs.found != 'true'
+        run: |
+          set -euo pipefail
+          out=$(go run ./cmd/typetown query -index index -json -limit 3 london)
+          echo "$out"
+          echo "$out" | grep -qi london
+
+      # Recorded inside the artifact so a downloaded index can be traced back to
+      # the data and the code it came from.
+      - name: Record the provenance in the artifact
+        if: steps.existing.outputs.found != 'true'
+        env:
+          DATA_FP: ${{ steps.upstream.outputs.fingerprint }}
+          CODE_FP: ${{ steps.code.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          {
+            echo "typetown index"
+            echo "built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit:  $GITHUB_SHA"
+            echo "run:     $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "data:    $DATA_FP"
+            echo "builder: $CODE_FP"
+            echo
+            echo "upstream (as reported by download.geonames.org):"
+            sed 's/^/  /' "$RUNNER_TEMP/upstream.txt"
+          } > index/SOURCES.txt
+          cat index/SOURCES.txt
+
+      - name: Upload the index
+        id: upload
+        if: steps.existing.outputs.found != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.upstream.outputs.artifact }}
+          path: index
+          retention-days: 90
+          if-no-files-found: error
+          # The index is mostly binary and already compact; squeezing it harder
+          # costs minutes of CPU for very little.
+          compression-level: 1
+
+      - name: Summary
+        if: always()
+        env:
+          NAME: ${{ steps.upstream.outputs.artifact }}
+          FOUND: ${{ steps.existing.outputs.found }}
+          URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "### Index"
+            echo
+            echo "Data \`${{ steps.upstream.outputs.fingerprint || 'unknown' }}\`, builder \`${{ steps.code.outputs.fingerprint || 'unknown' }}\`."
+            echo
+            if [ "$FOUND" = "true" ]; then
+              echo "Neither the upstream data nor the builder has changed since \`$NAME\` was built, so nothing was rebuilt."
+              echo "Re-run with **force** to build it again anyway."
+            elif [ -n "$URL" ]; then
+              echo "Built and uploaded as [\`$NAME\`]($URL)."
+            else
+              echo "No artifact was produced; see the failing step above."
+            fi
+            if [ -s "$RUNNER_TEMP/upstream.txt" ]; then
+              echo
+              echo '```'
+              cat "$RUNNER_TEMP/upstream.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

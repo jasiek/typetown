@@ -50,6 +50,44 @@ typetown build -countries GB -out index-gb        # a fast subset for developmen
 typetown build -min-population 1000               # smaller index, fewer hamlets
 ```
 
+### A prebuilt index from CI
+
+`.github/workflows/index.yml` builds the whole-world index and attaches it to
+the run as a downloadable artifact, for anyone who would rather not spend
+625 MB and a few minutes of CPU on it. Start it from the **Actions** tab →
+**Index** → **Run workflow**.
+
+Before doing anything else the run works out what the index would be built
+from — the size of each input, asked of `download.geonames.org`, and a hash of
+the packages that turn those inputs into an index — and skips the build when an
+artifact for that pair is still around. Running it again when nothing has moved
+therefore costs four HEAD requests. Tick **force** to rebuild regardless.
+
+Both halves of that key are deliberate:
+
+- **Size, rather than `Last-Modified` or the `ETag`.** The dumps are
+  regenerated nightly whether or not the data moved, so both of those always
+  change (Apache builds the `ETag` out of the size and the mtime). Size is the
+  only header here that tracks the data, since re-zipping unchanged rows
+  produces the same number of bytes. It is not a checksum, so two different
+  dumps of identical length would be missed; **force** is the way out of that.
+- **The builder, not the commit.** A change to the parser, the ranking or the
+  on-disk format does not move the dump sizes, and reusing an index across one
+  would be wrong — a `FormatVersion` bump would leave it rejected outright.
+  Hashing only the packages that write an index means a README or serve-side
+  change costs nothing.
+
+Artifacts are named `typetown-index-<data>-<builder>` and expire after 90 days.
+Unzip one and point the commands at it:
+
+```sh
+typetown query -index path/to/index london
+typetown serve -index path/to/index
+```
+
+`SOURCES.txt` inside records the commit, the run and the upstream files it was
+built from, so a downloaded index can be traced back to where it came from.
+
 ## Query
 
 ```sh
