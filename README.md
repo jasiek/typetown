@@ -50,18 +50,38 @@ typetown build -countries GB -out index-gb        # a fast subset for developmen
 typetown build -min-population 1000               # smaller index, fewer hamlets
 ```
 
-### A prebuilt index from CI
+### Download one instead
 
-`.github/workflows/index.yml` builds the whole-world index and attaches it to
-the run as a downloadable artifact, for anyone who would rather not spend
-625 MB and a few minutes of CPU on it. Start it from the **Actions** tab →
-**Index** → **Run workflow**.
+The whole-world index is published as a release asset, so nothing but `curl` is
+needed to get one:
 
-Before doing anything else the run works out what the index would be built
-from — the size of each input, asked of `download.geonames.org`, and a hash of
-the packages that turn those inputs into an index — and skips the build when an
-artifact for that pair is still around. Running it again when nothing has moved
-therefore costs four HEAD requests. Tick **force** to rebuild regardless.
+```sh
+curl -fLO https://github.com/jasiek/typetown/releases/download/index-latest/typetown-index.zip
+unzip typetown-index.zip          # -> index/
+typetown serve -index index
+```
+
+That URL never changes: `.github/workflows/index.yml` regenerates the
+`index-latest` release in place. It is a release rather than a workflow
+artifact because an artifact is only a download for somebody logged in to
+GitHub, expires after 90 days, and has no stable address. The release is marked
+a pre-release so that it never takes the "Latest release" slot from the `v*`
+tags, which are what `go install` follows.
+
+`typetown-index.zip.sha256` and `SOURCES.txt` sit beside the archive, the
+second recording the commit, the run and the upstream files the index was built
+from, so a download can be traced back to where it came from without unzipping
+250 MB.
+
+#### Rebuilding it
+
+Start the workflow from the **Actions** tab → **Index** → **Run workflow**.
+Before doing anything else it works out what the index would be built from —
+the size of each input, asked of `download.geonames.org`, and a hash of the
+packages that turn those inputs into an index — and stops there when the
+published `SOURCES.txt` already names that pair. Running it again when nothing
+has moved therefore costs four HEAD requests. Tick **force** to rebuild
+regardless.
 
 Both halves of that key are deliberate:
 
@@ -76,17 +96,6 @@ Both halves of that key are deliberate:
   would be wrong — a `FormatVersion` bump would leave it rejected outright.
   Hashing only the packages that write an index means a README or serve-side
   change costs nothing.
-
-Artifacts are named `typetown-index-<data>-<builder>` and expire after 90 days.
-Unzip one and point the commands at it:
-
-```sh
-typetown query -index path/to/index london
-typetown serve -index path/to/index
-```
-
-`SOURCES.txt` inside records the commit, the run and the upstream files it was
-built from, so a downloaded index can be traced back to where it came from.
 
 ## Query
 
@@ -427,6 +436,10 @@ Three things about tags are worth knowing before pushing one:
 - **`v2` and beyond change the import path.** The module path gains a `/v2`
   suffix in `go.mod` and in every import. Until then `v0.x` says the API may
   break between releases, which is honest while it is still settling.
+
+None of that applies to `index-latest`, the tag the index workflow publishes
+under. It carries data rather than code, it is not a semver tag so the module
+proxy never looks at it, and its release is rewritten in place on purpose.
 
 ## Development
 
