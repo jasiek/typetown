@@ -102,7 +102,7 @@ func TestServeMuxPathAndQuiet(t *testing.T) {
 	}
 }
 
-func TestSplitOrigins(t *testing.T) {
+func TestSplitList(t *testing.T) {
 	tests := []struct {
 		in   string
 		want []string
@@ -114,14 +114,14 @@ func TestSplitOrigins(t *testing.T) {
 		{",", nil},
 	}
 	for _, tt := range tests {
-		got := splitOrigins(tt.in)
+		got := splitList(tt.in)
 		if len(got) != len(tt.want) {
-			t.Errorf("splitOrigins(%q) = %q, want %q", tt.in, got, tt.want)
+			t.Errorf("splitList(%q) = %q, want %q", tt.in, got, tt.want)
 			continue
 		}
 		for i := range got {
 			if got[i] != tt.want[i] {
-				t.Errorf("splitOrigins(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Errorf("splitList(%q) = %q, want %q", tt.in, got, tt.want)
 				break
 			}
 		}

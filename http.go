@@ -79,6 +79,7 @@ func WithCacheControl(v string) HandlerOption {
 //
 //	GET <mount>?q=lond&limit=5&home=GB
 //	GET <mount>?q=lond&limit=5&lat=42.33&lon=-83.05
+//	GET <mount>?q=lond&countries=US,CA
 //
 //	{"query":"lond","results":[{"id":2643743,"name":"London", ... }]}
 //
@@ -140,9 +141,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	countries, err := countriesFrom(r)
+	if err != nil {
+		h.fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	results, err := h.ix.Search(q, SearchOptions{
-		Limit: limit, Home: h.homeFor(r), Near: near,
+		Limit: limit, Home: h.homeFor(r), Near: near, Countries: countries,
 	})
 	if err != nil {
 		h.fail(w, http.StatusInternalServerError, "search failed")
@@ -186,6 +192,26 @@ func nearFrom(r *http.Request) (*LatLon, error) {
 		return nil, errors.New("lon must be a number between -180 and 180")
 	}
 	return &LatLon{Lat: lat, Lon: lon}, nil
+}
+
+// countriesFrom reads the countries a request is restricted to, as a
+// comma-separated list of ISO-3166 alpha-2 codes. A code that is well formed but
+// has no places is not an error — it simply matches nothing — but anything that
+// is not two letters is a mistake worth reporting.
+func countriesFrom(r *http.Request) ([]string, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("countries"))
+	if raw == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, cc := range strings.Split(raw, ",") {
+		cc = strings.ToUpper(strings.TrimSpace(cc))
+		if len(cc) != 2 || cc[0] < 'A' || cc[0] > 'Z' || cc[1] < 'A' || cc[1] > 'Z' {
+			return nil, errors.New("countries must be comma-separated two-letter ISO codes")
+		}
+		out = append(out, cc)
+	}
+	return out, nil
 }
 
 // homeFor resolves the country to bias toward: the request's own parameter

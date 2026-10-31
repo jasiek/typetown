@@ -31,6 +31,7 @@ func runBench(env Env, args []string) error {
 		set        = fs.String("queries", "", "query set file (default: a built-in sample)")
 		limit      = fs.Int("limit", 10, "results to request per query")
 		home       = fs.String("home", "", "ISO country code to bias results toward")
+		only       = fs.String("countries", "", "comma-separated ISO country codes to restrict results to")
 		pool       = fs.Int("pool", 2000, "candidates to consider before ranking")
 		repeat     = fs.Int("repeat", 1, "run the whole query set this many times")
 		prefixes   = fs.String("prefixes", "", "also run truncations of each query at these lengths, e.g. 3,4,5")
@@ -79,7 +80,9 @@ flags:
 		return err
 	}
 	defer ix.Close()
-	opts := index.SearchOptions{Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool}
+	opts := index.SearchOptions{
+		Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool, Countries: splitList(*only),
+	}
 
 	// tally accumulates weighted hit counts, for the whole set and per country.
 	type tally struct{ total, h1, h3, h10 int }

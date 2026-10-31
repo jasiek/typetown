@@ -21,6 +21,7 @@ func runQuery(env Env, args []string) error {
 		dir      = fs.String("index", "index", "index directory")
 		limit    = fs.Int("limit", 10, "results to return")
 		home     = fs.String("home", "", "ISO country code to bias results toward, e.g. US")
+		only     = fs.String("countries", "", "comma-separated ISO country codes to restrict results to, e.g. US,CA")
 		asJSON   = fs.Bool("json", false, "emit results as JSON")
 		pool     = fs.Int("pool", 2000, "candidates to consider before ranking")
 		lat      = fs.Float64("lat", 0, "latitude of the user, to rank nearby places higher")
@@ -41,7 +42,9 @@ func runQuery(env Env, args []string) error {
 	}
 	defer ix.Close()
 
-	opts := index.SearchOptions{Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool}
+	opts := index.SearchOptions{
+		Limit: *limit, Home: strings.ToUpper(*home), Pool: *pool, Countries: splitList(*only),
+	}
 	// Coordinates supersede the country hint, so only take them when given.
 	latSet, lonSet := false, false
 	fs.Visit(func(f *flag.Flag) {
@@ -141,6 +144,9 @@ func interactive(env Env, ix *index.Index, opts index.SearchOptions, asJSON bool
 		Version(), m.Records, m.Keys)
 	if opts.Home != "" {
 		fmt.Fprintf(env.Stdout, "biasing results toward %s\n", opts.Home)
+	}
+	if len(opts.Countries) > 0 {
+		fmt.Fprintf(env.Stdout, "only places in %s\n", strings.Join(opts.Countries, ", "))
 	}
 	sc := bufio.NewScanner(env.Stdin)
 	for {

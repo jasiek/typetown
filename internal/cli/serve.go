@@ -38,6 +38,7 @@ Serve place lookups over HTTP.
 
     GET <path>?q=lond&limit=5&home=GB
     GET <path>?q=lond&lat=51.5&lon=-0.12
+    GET <path>?q=lond&countries=US,CA
     GET /healthz
 
 flags:
@@ -65,7 +66,7 @@ flags:
 		opts = append(opts, typetown.WithHomeHeader(*homeHeader))
 	}
 	if *cors != "" {
-		opts = append(opts, typetown.WithCORS(splitOrigins(*cors)...))
+		opts = append(opts, typetown.WithCORS(splitList(*cors)...))
 	}
 
 	mux := serveMux(ix, *path, opts, *quiet, env.Stderr)
@@ -155,7 +156,8 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func splitOrigins(s string) []string {
+// splitList splits a comma-separated flag value, dropping blanks.
+func splitList(s string) []string {
 	parts := strings.Split(s, ",")
 	out := parts[:0]
 	for _, p := range parts {

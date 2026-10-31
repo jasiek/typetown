@@ -91,6 +91,12 @@ type SearchOptions struct {
 	// Pool caps how many candidates a scan gathers before ranking. Zero picks a
 	// sensible default. Raising it costs latency on short prefixes.
 	Pool int
+	// Countries restricts results to these ISO-3166 alpha-2 codes, or nil for
+	// everywhere. Unlike an unrestricted search, which ranks a precomputed sample
+	// for short prefixes, a restricted one considers every match in those
+	// countries: the results are exactly the best Limit of them. Codes the index
+	// has no places for match nothing.
+	Countries []string
 }
 
 // Result is one ranked place.
@@ -134,6 +140,7 @@ func (x *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 	}
 	hits, err := x.ix.Search(query, index.SearchOptions{
 		Limit: opts.Limit, Home: opts.Home, Near: near, Pool: opts.Pool,
+		Countries: opts.Countries,
 	})
 	if err != nil {
 		return nil, err
