@@ -245,7 +245,8 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 // gatherHot serves a prefix that has a precomputed shortlist, and reports
 // whether it did. The shortlist is a ranked sample rather than the whole range,
 // so an exact hit on the query itself is added separately: it carries a bonus
-// the build-time score could not know about.
+// the build-time score could not know about. Names are keyed by country, so
+// that takes one lookup per country.
 func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	off, ok, err := ix.hotFST.Get([]byte(q))
 	if err != nil {
@@ -260,9 +261,20 @@ func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	}); err != nil {
 		return false, err
 	}
-	if poff, exact, err := ix.fst.Get([]byte(q)); err != nil {
+	r, err := ix.fst.Reader()
+	if err != nil {
 		return false, fmt.Errorf("exact lookup %q: %w", q, err)
-	} else if exact {
+	}
+	key := make([]byte, 0, countryKeyLen+len(q))
+	for c := range ix.m.Countries {
+		key = appendCountryKey(key[:0], c, q)
+		poff, exact, err := r.Get(key)
+		if err != nil {
+			return false, fmt.Errorf("exact lookup %q: %w", q, err)
+		}
+		if !exact {
+			continue
+		}
 		if err := ix.eachEntry(ix.postings, poff, func(ord uint32, score float64) bool {
 			keep(ord, score+ExactBonus)
 			return true
@@ -273,34 +285,53 @@ func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	return true, nil
 }
 
-// gatherScan walks every key under a prefix. It is only reached for prefixes
-// that were not hot, which by construction have few keys beneath them, so the
-// pool ceiling is a safety net rather than a sampling policy.
+// gatherScan walks every key under a prefix, country by country. It is only
+// reached for prefixes that were not hot, which by construction have few keys
+// beneath them, so the pool ceiling is a safety net rather than a sampling
+// policy.
 func (ix *Index) gatherScan(q string, pool int, keep func(uint32, float64)) error {
+	var it vellum.FSTIterator // reused across countries: building one allocates
 	n := 0
-	it, err := ix.fst.Iterator([]byte(q), prefixSuccessor(q))
+	for c := range ix.m.Countries {
+		used, err := ix.scanCountry(&it, c, q, pool-n, keep)
+		if err != nil {
+			return err
+		}
+		if n += used; n >= pool {
+			break
+		}
+	}
+	return nil
+}
+
+// scanCountry walks every key under a prefix within one country, keeping at
+// most budget postings, and reports how many it kept.
+func (ix *Index) scanCountry(it *vellum.FSTIterator, c int, q string, budget int, keep func(uint32, float64)) (int, error) {
+	lo := appendCountryKey(nil, c, q)
+	n := 0
+	err := it.Reset(ix.fst, lo, prefixSuccessor(string(lo)), nil)
 	for err == nil {
 		key, off := it.Current()
 		bonus := 0.0
-		if len(key) == len(q) {
+		if len(key) == len(lo) {
 			bonus = ExactBonus
 		}
 		if perr := ix.eachEntry(ix.postings, off, func(ord uint32, score float64) bool {
 			keep(ord, score+bonus)
 			n++
-			return n < pool
+			return n < budget
 		}); perr != nil {
-			return perr
+			return n, perr
 		}
-		if n >= pool {
+		if n >= budget {
 			break
 		}
 		err = it.Next()
 	}
 	if err != nil && err != vellum.ErrIteratorDone {
-		return fmt.Errorf("search %q: %w", q, err)
+		return n, fmt.Errorf("search %q: %w", q, err)
 	}
-	return nil
+	return n, nil
 }
 
 func (ix *Index) countryIndex(cc string) int {

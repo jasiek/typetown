@@ -3,12 +3,17 @@
 // An index is a directory of four files:
 //
 //	manifest.json  counts, and the string tables records refer to by number
-//	names.fst      finite state transducer: folded name -> postings.bin offset
+//	names.fst      finite state transducer: country + folded name -> postings.bin offset
 //	postings.bin   per key, the matching records in descending score order
 //	records.bin    packed place records, addressed by ordinal
 //	records.idx    little-endian uint32 start of each record, plus a sentinel
 //	hot.fst        the prefixes with too many keys to scan -> hot.bin offset
 //	hot.bin        per hot prefix, a precomputed top-K in descending score order
+//
+// Keys in names.fst lead with the record's country (see appendCountryKey), so
+// every country's names form one contiguous range. A query restricted to some
+// countries walks only their ranges; an unrestricted one walks each country's
+// range in turn, which costs one seek per country.
 //
 // The split exists so that a query touches as little as possible: walking a
 // prefix reads only the FST, and only the handful of records that survive
@@ -20,7 +25,7 @@ const (
 	// FormatVersion is bumped whenever the on-disk encoding changes in a way a
 	// previously built index cannot survive. Readers refuse mismatches rather
 	// than misinterpreting bytes.
-	FormatVersion = 3
+	FormatVersion = 4
 
 	manifestFile = "manifest.json"
 	fstFile      = "names.fst"
@@ -37,6 +42,20 @@ const (
 	// scoreScale converts scores to the fixed-point integers stored in postings.
 	scoreScale = 100
 )
+
+// countryKeyLen is how many bytes of a names.fst key name its country.
+const countryKeyLen = 2
+
+// maxCountries is how many countries a two-byte key prefix can tell apart.
+const maxCountries = 1 << 16
+
+// appendCountryKey appends the names.fst key for a folded name in a country:
+// the country's index in the manifest, big-endian so that keys sort country
+// first, then the name itself.
+func appendCountryKey[T string | []byte](dst []byte, country int, name T) []byte {
+	dst = append(dst, byte(country>>8), byte(country))
+	return append(dst, name...)
+}
 
 // Manifest is the index's self-description. String tables live here rather than
 // in records.bin so that "United Kingdom" is stored once instead of 250,000
