@@ -1,6 +1,6 @@
 // Package index reads and writes typetown's on-disk autocomplete index.
 //
-// An index is a directory of four files:
+// An index is a directory of these files:
 //
 //	manifest.json  counts, and the string tables records refer to by number
 //	names.fst      finite state transducer: country + folded name -> postings.bin offset
@@ -9,6 +9,8 @@
 //	records.idx    little-endian uint32 start of each record, plus a sentinel
 //	hot.fst        the prefixes with too many keys to scan -> hot.bin offset
 //	hot.bin        per hot prefix, a precomputed top-K in descending score order
+//	countryhot.fst the same, per country: country + prefix -> countryhot.bin offset
+//	countryhot.bin per country's hot prefix, its top-K in descending score order
 //
 // Keys in names.fst lead with the record's country (see appendCountryKey), so
 // every country's names form one contiguous range. A query restricted to some
@@ -34,6 +36,9 @@ const (
 	recordsIdx   = "records.idx"
 	hotFSTFile   = "hot.fst"
 	hotFile      = "hot.bin"
+
+	countryHotFSTFile = "countryhot.fst"
+	countryHotFile    = "countryhot.bin"
 
 	// coordScale converts degrees to the fixed-point integers stored in records.
 	// GeoNames publishes five decimal places, i.e. about one metre.
@@ -61,20 +66,22 @@ func appendCountryKey[T string | []byte](dst []byte, country int, name T) []byte
 // in records.bin so that "United Kingdom" is stored once instead of 250,000
 // times.
 type Manifest struct {
-	Version      int      `json:"version"`
-	Built        string   `json:"built"`
-	Source       string   `json:"source"`
-	Records      int      `json:"records"`
-	Keys         int      `json:"keys"`
-	Postings     int      `json:"postings"`
-	HotPrefixes  int      `json:"hotPrefixes"`
-	HotThreshold int      `json:"hotThreshold"`
-	HotK         int      `json:"hotK"`
-	Countries    []string `json:"countries"`    // parallel to CountryNames
-	CountryNames []string `json:"countryNames"` //
-	Regions      []string `json:"regions"`      // display names of admin1 divisions
-	FeatureCodes []string `json:"featureCodes"` //
-	Filter       string   `json:"filter"`       // human-readable build filter
+	Version     int    `json:"version"`
+	Built       string `json:"built"`
+	Source      string `json:"source"`
+	Records     int    `json:"records"`
+	Keys        int    `json:"keys"`
+	Postings    int    `json:"postings"`
+	HotPrefixes int    `json:"hotPrefixes"`
+	// CountryHotPrefixes counts the (country, prefix) pairs with a shortlist.
+	CountryHotPrefixes int      `json:"countryHotPrefixes"`
+	HotThreshold       int      `json:"hotThreshold"`
+	HotK               int      `json:"hotK"`
+	Countries          []string `json:"countries"`    // parallel to CountryNames
+	CountryNames       []string `json:"countryNames"` //
+	Regions            []string `json:"regions"`      // display names of admin1 divisions
+	FeatureCodes       []string `json:"featureCodes"` //
+	Filter             string   `json:"filter"`       // human-readable build filter
 }
 
 // Result is one ranked answer: a place, and where it is.
