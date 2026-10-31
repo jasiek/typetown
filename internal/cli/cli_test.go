@@ -48,6 +48,18 @@ func TestRun(t *testing.T) {
 			wantStdout: "typetown ",
 		},
 		{
+			name:       "version names the index format it reads",
+			args:       []string{"version"},
+			wantCode:   exitOK,
+			wantStdout: "(index format v4)",
+		},
+		{
+			name:       "version -index-format prints only the number",
+			args:       []string{"version", "-index-format"},
+			wantCode:   exitOK,
+			wantStdout: "4\n",
+		},
+		{
 			name:       "version rejects extra arguments",
 			args:       []string{"version", "please"},
 			wantCode:   exitError,

@@ -3,6 +3,8 @@ package cli
 import (
 	"fmt"
 	"runtime/debug"
+
+	"github.com/jasiek/typetown/internal/index"
 )
 
 // version is stamped in at build time by the Makefile:
@@ -50,10 +52,19 @@ func Version() string {
 	return "(devel) " + revision
 }
 
+// runVersion prints the version, and the index format this build reads. With
+// -index-format it prints only the format's number, which is what names the
+// published index a deployment should download:
+//
+//	curl -fLO .../index-latest/typetown-index-v$(typetown version -index-format).zip
 func runVersion(env Env, args []string) error {
+	if len(args) == 1 && args[0] == "-index-format" {
+		fmt.Fprintln(env.Stdout, index.FormatVersion)
+		return nil
+	}
 	if len(args) > 0 {
 		return fmt.Errorf("version: unexpected argument %q", args[0])
 	}
-	fmt.Fprintf(env.Stdout, "typetown %s\n", Version())
+	fmt.Fprintf(env.Stdout, "typetown %s (index format v%d)\n", Version(), index.FormatVersion)
 	return nil
 }
