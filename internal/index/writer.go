@@ -2,6 +2,7 @@ package index
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -50,6 +51,7 @@ type builder struct {
 
 	recOffsets []uint32  // ordinal -> offset into records.bin
 	prominence []float32 // ordinal -> prominence
+	recCountry []uint16  // ordinal -> country index, which leads its names.fst keys
 	idToOrd    map[int32]uint32
 
 	countries    []string
@@ -113,6 +115,11 @@ func (b *builder) writeRecords() error {
 		b.prominence = append(b.prominence, float32(p))
 
 		buf = b.encodeRecord(buf[:0], r)
+		cc := b.countryIdx[r.CountryCode]
+		if cc >= maxCountries {
+			return fmt.Errorf("more than %d countries: a names.fst key cannot tell them apart", maxCountries)
+		}
+		b.recCountry = append(b.recCountry, uint16(cc))
 		n, err := w.Write(buf)
 		if err != nil {
 			return fmt.Errorf("write record: %w", err)
@@ -209,25 +216,32 @@ func (b *builder) addKey(name string, ord uint32, class geonames.Class) {
 
 func (b *builder) key(r keyRef) []byte { return b.arena[r.off : r.off+uint32(r.ln)] }
 
+// sameKey reports whether two edges share a names.fst key: the same name in the
+// same country.
+func (b *builder) sameKey(x, y keyRef) bool {
+	return b.recCountry[x.ord] == b.recCountry[y.ord] && slices.Equal(b.key(x), b.key(y))
+}
+
 // writeIndex sorts the keys, writes each key's posting list in descending score
 // order, and builds the FST over the keys pointing at those lists.
 func (b *builder) writeIndex() (*Manifest, error) {
+	// Hot prefixes are found across every country at once, so they need the keys
+	// in name order. names.fst wants them grouped by country instead, so they are
+	// sorted once for each.
 	b.opts.Progress("sorting keys", len(b.keys))
-	slices.SortFunc(b.keys, func(x, y keyRef) int {
-		if c := strings.Compare(string(b.key(x)), string(b.key(y))); c != 0 {
-			return c
-		}
-		// Highest score first, so a posting list is written already sorted.
-		sx := EdgeScore(float64(b.prominence[x.ord]), geonames.Class(x.class))
-		sy := EdgeScore(float64(b.prominence[y.ord]), geonames.Class(y.class))
-		switch {
-		case sx > sy:
-			return -1
-		case sx < sy:
-			return 1
-		}
-		return int(x.ord) - int(y.ord)
-	})
+	b.sortKeys(false)
+	hots := b.collectHot(false)
+	if err := b.writeHot(hotFSTFile, hotFile, hots); err != nil {
+		return nil, err
+	}
+	b.opts.Progress("hot prefixes", len(hots))
+
+	b.sortKeys(true)
+	ccHots := b.collectHot(true)
+	if err := b.writeHot(countryHotFSTFile, countryHotFile, ccHots); err != nil {
+		return nil, err
+	}
+	b.opts.Progress("country hot prefixes", len(ccHots))
 
 	pf, err := os.Create(filepath.Join(b.opts.OutDir, postingsFile))
 	if err != nil {
@@ -252,6 +266,7 @@ func (b *builder) writeIndex() (*Manifest, error) {
 		nkeys    int
 		npost    int
 		scratch  []byte
+		kbuf     []byte
 		postings []keyRef
 	)
 	flush := func() error {
@@ -267,7 +282,8 @@ func (b *builder) writeIndex() (*Manifest, error) {
 			s := EdgeScore(float64(b.prominence[p.ord]), geonames.Class(p.class))
 			scratch = binary.AppendVarint(scratch, int64(s*scoreScale))
 		}
-		if err := fst.Insert(b.key(postings[0]), poff); err != nil {
+		kbuf = appendCountryKey(kbuf[:0], int(b.recCountry[postings[0].ord]), b.key(postings[0]))
+		if err := fst.Insert(kbuf, poff); err != nil {
 			return fmt.Errorf("fst insert: %w", err)
 		}
 		n, err := pw.Write(scratch)
@@ -282,7 +298,7 @@ func (b *builder) writeIndex() (*Manifest, error) {
 	}
 
 	for i, k := range b.keys {
-		if i > 0 && !slices.Equal(b.key(k), b.key(b.keys[i-1])) {
+		if i > 0 && !b.sameKey(k, b.keys[i-1]) {
 			if err := flush(); err != nil {
 				return nil, err
 			}
@@ -313,21 +329,40 @@ func (b *builder) writeIndex() (*Manifest, error) {
 	}
 	b.opts.Progress("keys", nkeys)
 
-	nhot, err := b.writeHotPrefixes()
-	if err != nil {
-		return nil, err
-	}
-	b.opts.Progress("hot prefixes", nhot)
-
 	m := &Manifest{
 		Version: FormatVersion, Built: time.Now().UTC().Format(time.RFC3339),
 		Source: "geonames", Records: len(b.recOffsets) - 1, Keys: nkeys, Postings: npost,
-		HotPrefixes: nhot, HotThreshold: b.opts.HotThreshold, HotK: hotK,
+		HotPrefixes: len(hots), CountryHotPrefixes: len(ccHots),
+		HotThreshold: b.opts.HotThreshold, HotK: hotK,
 		Countries: b.countries, CountryNames: b.countryNames,
 		Regions: b.regions, FeatureCodes: b.features,
 		Filter: describeFilter(b.opts.Filter),
 	}
 	return m, b.writeManifest(m)
+}
+
+// sortKeys orders the keys by name, or by country and then name, and within one
+// key highest score first, so a posting list is written already sorted.
+func (b *builder) sortKeys(byCountry bool) {
+	slices.SortFunc(b.keys, func(x, y keyRef) int {
+		if byCountry {
+			if c := cmp.Compare(b.recCountry[x.ord], b.recCountry[y.ord]); c != 0 {
+				return c
+			}
+		}
+		if c := strings.Compare(string(b.key(x)), string(b.key(y))); c != 0 {
+			return c
+		}
+		sx := EdgeScore(float64(b.prominence[x.ord]), geonames.Class(x.class))
+		sy := EdgeScore(float64(b.prominence[y.ord]), geonames.Class(y.class))
+		switch {
+		case sx > sy:
+			return -1
+		case sx < sy:
+			return 1
+		}
+		return int(x.ord) - int(y.ord)
+	})
 }
 
 func (b *builder) writeManifest(m *Manifest) error {
@@ -416,19 +451,24 @@ func describeFilter(f geonames.Filter) string {
 	return strings.Join(parts, " ")
 }
 
-// writeHotPrefixes precomputes a ranked shortlist for every prefix with enough
-// keys beneath it that scanning them on each keystroke would be too slow.
-//
-// b.keys is already sorted by key, so every prefix's keys are contiguous and one
-// pass suffices: a prefix ends exactly where the current key stops sharing it
-// with the previous one.
-func (b *builder) writeHotPrefixes() (int, error) {
-	type hotEntry struct {
-		prefix string
-		list   []candidate
-	}
-	var hots []hotEntry
+type hotEntry struct {
+	prefix string
+	list   []candidate
+}
 
+// collectHot precomputes a ranked shortlist for every prefix with enough keys
+// beneath it that scanning them on each keystroke would be too slow.
+//
+// With byCountry unset, prefixes span every country and b.keys must be sorted
+// by name. With it set, each country's prefixes are counted on their own,
+// b.keys must be sorted by country and then name, and each prefix is emitted
+// as a country key.
+//
+// Either way every prefix's keys are contiguous, so one pass suffices: a prefix
+// ends exactly where the current key stops sharing it with the previous one, or
+// where the country changes.
+func (b *builder) collectHot(byCountry bool) []hotEntry {
+	var hots []hotEntry
 	levels := make([]*topK, maxPrefixLen+1)
 	counts := make([]int, maxPrefixLen+1)
 	for i := 1; i <= maxPrefixLen; i++ {
@@ -436,12 +476,17 @@ func (b *builder) writeHotPrefixes() (int, error) {
 	}
 
 	var prev []byte
+	prevCC := -1
 	// flush closes out every prefix level at or below `from`, emitting the ones
 	// that turned out to be hot.
 	flush := func(from int) {
 		for L := maxPrefixLen; L >= from; L-- {
 			if counts[L] >= b.opts.HotThreshold && L <= len(prev) {
-				hots = append(hots, hotEntry{string(prev[:L]), levels[L].drain()})
+				prefix := string(prev[:L])
+				if byCountry {
+					prefix = string(appendCountryKey(nil, prevCC, prefix))
+				}
+				hots = append(hots, hotEntry{prefix, levels[L].drain()})
 			}
 			levels[L].reset()
 			counts[L] = 0
@@ -450,9 +495,17 @@ func (b *builder) writeHotPrefixes() (int, error) {
 
 	for i, k := range b.keys {
 		key := b.key(k)
-		newKey := i == 0 || !slices.Equal(key, prev)
+		cc := -1
+		if byCountry {
+			cc = int(b.recCountry[k.ord])
+		}
+		newKey := i == 0 || cc != prevCC || !slices.Equal(key, prev)
 		if i > 0 && newKey {
-			flush(commonPrefixLen(key, prev) + 1)
+			if cc != prevCC {
+				flush(1) // a new country closes every prefix of the last one
+			} else {
+				flush(commonPrefixLen(key, prev) + 1)
+			}
 		}
 		score := EdgeScore(float64(b.prominence[k.ord]), geonames.Class(k.class))
 		for L := 1; L <= min(len(key), maxPrefixLen); L++ {
@@ -465,28 +518,33 @@ func (b *builder) writeHotPrefixes() (int, error) {
 				levels[L].add(k.ord, score)
 			}
 		}
-		prev = key
+		prev, prevCC = key, cc
 	}
 	flush(1)
+	return hots
+}
 
+// writeHot writes shortlists to an FST from prefix to list offset, and the
+// lists themselves in the posting-list encoding.
+func (b *builder) writeHot(fstName, listName string, hots []hotEntry) error {
 	slices.SortFunc(hots, func(x, y hotEntry) int { return strings.Compare(x.prefix, y.prefix) })
 
-	hf, err := os.Create(filepath.Join(b.opts.OutDir, hotFile))
+	hf, err := os.Create(filepath.Join(b.opts.OutDir, listName))
 	if err != nil {
-		return 0, fmt.Errorf("create hot lists: %w", err)
+		return fmt.Errorf("create hot lists: %w", err)
 	}
 	defer hf.Close()
 	hw := bufio.NewWriterSize(hf, 1<<20)
 
-	ff, err := os.Create(filepath.Join(b.opts.OutDir, hotFSTFile))
+	ff, err := os.Create(filepath.Join(b.opts.OutDir, fstName))
 	if err != nil {
-		return 0, fmt.Errorf("create hot fst: %w", err)
+		return fmt.Errorf("create hot fst: %w", err)
 	}
 	defer ff.Close()
 	fw := bufio.NewWriterSize(ff, 1<<20)
 	fst, err := vellum.New(fw, nil)
 	if err != nil {
-		return 0, fmt.Errorf("new hot fst: %w", err)
+		return fmt.Errorf("new hot fst: %w", err)
 	}
 
 	var off uint64
@@ -499,22 +557,22 @@ func (b *builder) writeHotPrefixes() (int, error) {
 			scratch = binary.AppendVarint(scratch, int64(c.score*scoreScale))
 		}
 		if err := fst.Insert([]byte(h.prefix), off); err != nil {
-			return 0, fmt.Errorf("hot fst insert %q: %w", h.prefix, err)
+			return fmt.Errorf("hot fst insert %q: %w", h.prefix, err)
 		}
 		n, err := hw.Write(scratch)
 		if err != nil {
-			return 0, fmt.Errorf("write hot list: %w", err)
+			return fmt.Errorf("write hot list: %w", err)
 		}
 		off += uint64(n)
 	}
 	if err := fst.Close(); err != nil {
-		return 0, fmt.Errorf("close hot fst: %w", err)
+		return fmt.Errorf("close hot fst: %w", err)
 	}
 	if err := fw.Flush(); err != nil {
-		return 0, fmt.Errorf("flush hot fst: %w", err)
+		return fmt.Errorf("flush hot fst: %w", err)
 	}
 	if err := hw.Flush(); err != nil {
-		return 0, fmt.Errorf("flush hot lists: %w", err)
+		return fmt.Errorf("flush hot lists: %w", err)
 	}
-	return len(hots), nil
+	return nil
 }

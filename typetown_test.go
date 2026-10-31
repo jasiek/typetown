@@ -239,6 +239,55 @@ func TestHandlerHomeBias(t *testing.T) {
 	}
 }
 
+func TestSearchCountries(t *testing.T) {
+	ix := openFixture(t)
+
+	res, err := ix.Search("springfield", typetown.SearchOptions{Limit: 5, Countries: []string{"US"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("Search(springfield, US) = %d results, want both US Springfields: %+v", len(res), res)
+	}
+	for _, r := range res {
+		if r.CC != "US" {
+			t.Errorf("Search(springfield, US) returned %s, %s", r.Name, r.CC)
+		}
+	}
+
+	res, err = ix.Search("london", typetown.SearchOptions{Limit: 5, Countries: []string{"NZ"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 0 {
+		t.Errorf("Search(london, NZ) = %+v, want nothing", res)
+	}
+}
+
+func TestHandlerCountries(t *testing.T) {
+	ix := openFixture(t)
+	h := typetown.Handler(ix)
+
+	res, body := get(t, h, "/?q=springfield&countries=nz")
+	if res.StatusCode != http.StatusOK || len(body.Results) != 1 || body.Results[0].CC != "NZ" {
+		t.Errorf("countries=nz: %d %+v, want just the NZ Springfield", res.StatusCode, body.Results)
+	}
+	res, body = get(t, h, "/?q=lond&countries=US,%20BR")
+	if res.StatusCode != http.StatusOK || len(body.Results) != 2 {
+		t.Fatalf("countries=US,BR: %d %+v, want London KY and Londrina", res.StatusCode, body.Results)
+	}
+	for _, r := range body.Results {
+		if r.CC != "US" && r.CC != "BR" {
+			t.Errorf("countries=US,BR returned %s, %s", r.Name, r.CC)
+		}
+	}
+	for _, bad := range []string{"USA", "U", "US,,CA", "1A"} {
+		if res, _ := get(t, h, "/?q=lond&countries="+bad); res.StatusCode != http.StatusBadRequest {
+			t.Errorf("countries=%s: status %d, want 400", bad, res.StatusCode)
+		}
+	}
+}
+
 // The bias is a nudge, not an override: a local homonym must not displace a
 // place that outranks it by orders of magnitude.
 func TestHandlerHomeBiasDoesNotOverrideProminence(t *testing.T) {

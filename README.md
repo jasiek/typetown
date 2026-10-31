@@ -56,19 +56,28 @@ The whole-world index is published as a release asset, so nothing but `curl` is
 needed to get one:
 
 ```sh
-curl -fLO https://github.com/jasiek/typetown/releases/download/index-latest/typetown-index.zip
-unzip typetown-index.zip          # -> index/
+v=$(typetown version -index-format)   # the index format this binary reads
+curl -fLO https://github.com/jasiek/typetown/releases/download/index-latest/typetown-index-v$v.zip
+unzip typetown-index-v$v.zip          # -> index/
 typetown serve -index index
 ```
 
-That URL never changes: `.github/workflows/index.yml` regenerates the
-`index-latest` release in place. It is a release rather than a workflow
+A binary reads exactly one index format and refuses any other, so each format is
+published under its own name — `typetown-index-v4.zip` — and a new format never
+replaces an old one. Replicas still running a release that reads an older format
+keep downloading the index they can open, and a rollout can upgrade binaries and
+indexes together rather than racing a moving URL. Assets for older formats stay
+in the release, frozen at their last build. (The unversioned
+`typetown-index.zip` is the last v3 index, from before this naming.)
+
+For a given format the URL never changes: `.github/workflows/index.yml`
+regenerates the `index-latest` release in place. It is a release rather than a workflow
 artifact because an artifact is only a download for somebody logged in to
 GitHub, expires after 90 days, and has no stable address. The release is marked
 a pre-release so that it never takes the "Latest release" slot from the `v*`
 tags, which are what `go install` follows.
 
-`typetown-index.zip.sha256` and `SOURCES.txt` sit beside the archive, the
+`typetown-index-v4.zip.sha256` and `SOURCES-v4.txt` sit beside the archive, the
 second recording the commit, the run and the upstream files the index was built
 from, so a download can be traced back to where it came from without unzipping
 250 MB.
@@ -79,9 +88,18 @@ Start the workflow from the **Actions** tab → **Index** → **Run workflow**.
 Before doing anything else it works out what the index would be built from —
 the size of each input, asked of `download.geonames.org`, and a hash of the
 packages that turn those inputs into an index — and stops there when the
-published `SOURCES.txt` already names that pair. Running it again when nothing
-has moved therefore costs four HEAD requests. Tick **force** to rebuild
-regardless.
+published `SOURCES-v<format>.txt` already names that pair. Running it again
+when nothing has moved therefore costs four HEAD requests. Tick **force** to
+rebuild regardless. From a terminal:
+
+```sh
+gh workflow run index.yml --ref main              # rebuild if anything moved
+gh workflow run index.yml --ref main -f force=true
+```
+
+Run it from `main`: the release is shared, so whatever ref the run builds is
+what every download of that format gets. Runs queue rather than overlap, and a
+queued run that finds its work already published stops at the comparison.
 
 Both halves of that key are deliberate:
 
@@ -102,6 +120,7 @@ Both halves of that key are deliberate:
 ```sh
 typetown query lond                    # one shot
 typetown query -home US -limit 5 york  # bias toward a country
+typetown query -countries US,CA spring # only places in these countries
 typetown query -json edinburgh         # machine-readable
 typetown query -i -home US             # interactive
 ```
@@ -146,6 +165,15 @@ places, err := ix.Search("krak", typetown.SearchOptions{Limit: 5, Home: "PL"})
 
 `Search` is safe for concurrent use. `Close` is not, and must not race with it.
 
+`Countries` restricts a search to some countries, and changes what it promises:
+an unrestricted search ranks a precomputed sample for short prefixes, while a
+restricted one considers every match in those countries, so its results are
+exactly the best `Limit` of them.
+
+```go
+places, err := ix.Search("spr", typetown.SearchOptions{Limit: 20, Countries: []string{"US", "CA"}})
+```
+
 ### A ready-to-attach endpoint
 
 `Handler` returns an `http.Handler` that answers lookups as JSON. It handles one
@@ -181,6 +209,16 @@ GET /places?q=lond&limit=3&home=US
   {"id":4517009,"name":"London","region":"Ohio","country":"United States", ...},
   {"id":4298960,"name":"London","region":"Kentucky","country":"United States", ...}]}
 ```
+
+`countries` restricts results the same way `Countries` does in the library:
+
+```
+GET /places?q=spring&countries=US,CA
+```
+
+Anything that is not a comma-separated list of two-letter codes is 400. A
+well-formed code the index has no places for is not an error; it matches
+nothing.
 
 A missing `q` is 400 and a non-GET method is 405, but a query that matches
 nothing is 200 with an empty list — finding no such town is an answer, not an
@@ -233,6 +271,7 @@ query should return. A query set is one case per line:
 typetown bench                                     # built-in sample, latency only
 typetown bench -queries set.tsv -home US           # latency and accuracy
 typetown bench -queries set.tsv -prefixes 3,4,5    # accuracy as a user types
+typetown bench -queries set.tsv -countries US      # restricted to some countries
 ```
 
 ## How it ranks
@@ -283,6 +322,36 @@ precomputes a ranked shortlist for every prefix with at least 500 keys beneath
 it — about 6,500 of them, 8 MB — and scans everything else exhaustively, which
 is cheap precisely because it is not hot.
 
+### Restricting to countries
+
+Every key in `names.fst` starts with its place's country, so each country's
+names sort together into one range. A search restricted to some countries walks
+only their ranges, and a prefix that is hot within one country — 7,374 of them,
+9 MB — has a per-country shortlist built the same way as the global one.
+
+A per-country shortlist is used only when it provably cannot change the answer.
+Everything it left out scored no higher than its last entry, and the caller's
+home and position can add at most `HomeBonus + NearBonus` to that. If the
+ceiling still reaches the score at the cut-off for the requested limit, a place
+left out could have ranked, so that country is walked in full. In practice that
+happens with a position and a one- or two-letter prefix: a nearby village can
+outrank the shortlist's last entry.
+
+Measured on the full dump, with 100 sampled places per country set (US, PL, GB,
+KZ, IS, US+PL and US+CA+GB+IE+AU), every restricted search matched a full walk of
+the same countries — 16,520 of 16,520. One-letter prefixes take 34µs at the
+median and 331µs at p99. Adding a position raises a one-letter prefix to
+1.6ms at the median and 12ms at p99, because of those fallback walks; from three
+letters on the median is unchanged and p99 stays near 1ms.
+
+Keying by country is not free for an unrestricted search. A prefix with no
+shortlist has to be walked once per country, and the exact-match bonus on a hot
+prefix takes one lookup per country. Results are unchanged, but the median goes
+from 65µs to 136µs and p99 from 0.50ms to 0.88ms, across a mix of one- to
+six-letter prefixes and full names. The index grows by 5%, from 256 MB to 269 MB, and a build takes
+66s rather than 49s, because the keys are sorted twice: by name for the global
+shortlists, then by country for everything else.
+
 ### Memory
 
 Index files are mapped read-only (`PROT_READ`, `MAP_SHARED`) rather than read
@@ -299,7 +368,7 @@ would rather have the snapshot.
 
 ## The index on disk
 
-Seven files. A filled diamond means one structure contains the other; a dashed
+Nine files. A filled diamond means one structure contains the other; a dashed
 arrow is a pointer — a number stored in one file that addresses another. Every
 hop below is one of those numbers, so a query resolves by arithmetic rather than
 by scanning.
@@ -309,34 +378,45 @@ classDiagram
     direction TB
 
     class NamesFST {
-        <<names.fst — 5,532,766 entries>>
-        +bytes key
+        <<names.fst — 5,781,902 entries>>
+        +uint16BE countryIdx
+        +bytes name
         +uint64 value
     }
     class HotFST {
-        <<hot.fst — 6,489 entries>>
-        +bytes key
+        <<hot.fst — 6,216 entries>>
+        +bytes prefix
+        +uint64 value
+    }
+    class CountryHotFST {
+        <<countryhot.fst — 7,374 entries>>
+        +uint16BE countryIdx
+        +bytes prefix
         +uint64 value
     }
     class PostingList {
-        <<postings.bin — 5,532,766 lists>>
+        <<postings.bin — 5,781,902 lists>>
         +uvarint count
     }
     class HotList {
-        <<hot.bin — 6,489 lists, count max 256>>
+        <<hot.bin — 6,216 lists, count max 256>>
+        +uvarint count
+    }
+    class CountryHotList {
+        <<countryhot.bin — 7,374 lists, count max 256>>
         +uvarint count
     }
     class Posting {
-        <<9,300,117 in total>>
+        <<9,030,366 in total>>
         +uvarint ordinal
         +varint score
     }
     class RecordsIdx {
-        <<records.idx — 5,165,451 slots>>
+        <<records.idx — 4,994,823 slots>>
         +uint32LE offset
     }
     class Record {
-        <<records.bin — 5,165,450 records>>
+        <<records.bin — 4,994,822 records>>
         +uvarint id
         +varint lat
         +varint lon
@@ -348,7 +428,7 @@ classDiagram
         +bytes name
     }
     class FeatureCodes {
-        <<manifest.featureCodes — 15>>
+        <<manifest.featureCodes — 14>>
         +string code
     }
     class Countries {
@@ -357,15 +437,17 @@ classDiagram
         +string name
     }
     class Regions {
-        <<manifest.regions — 3,752, slot 0 = none>>
+        <<manifest.regions — 3,749, slot 0 = none>>
         +string name
     }
 
     PostingList *-- "count" Posting : contains
     HotList *-- "count" Posting : contains
+    CountryHotList *-- "count" Posting : contains
 
     NamesFST ..> PostingList : value = byte offset
     HotFST ..> HotList : value = byte offset
+    CountryHotFST ..> CountryHotList : value = byte offset
     Posting ..> RecordsIdx : ordinal = slot
     RecordsIdx ..> Record : offset = first byte
     Record ..> FeatureCodes : featureIdx
@@ -373,9 +455,11 @@ classDiagram
     Record ..> Regions : regionIdx
 ```
 
-`names.fst` is walked for every query. `hot.fst` short-circuits the prefixes with
-too many keys beneath them to walk on a keystroke; both paths converge on record
-ordinals. Repeated strings — country, region, feature code — live once in
+`names.fst` is walked for every query, one country's range at a time: its keys
+are the country's index as two big-endian bytes followed by the folded name, so
+each country's names sort together. `hot.fst` short-circuits the prefixes with
+too many keys beneath them to walk on a keystroke, and `countryhot.fst` does the
+same for a prefix within one country; every path converges on record ordinals. Repeated strings — country, region, feature code — live once in
 `manifest.json` and are referenced by position, so "United Kingdom" is not
 written 250,000 times.
 

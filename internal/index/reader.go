@@ -4,9 +4,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/blevesearch/vellum"
 
@@ -15,15 +18,17 @@ import (
 
 // Index is an open, queryable index.
 type Index struct {
-	m       *Manifest
-	fst     *vellum.FST
-	hotFST  *vellum.FST
-	mapped  []*mapping // everything to release on Close
-	records []byte
-	offsets []byte // little-endian uint32 per record, plus a trailing sentinel
+	m        *Manifest
+	fst      *vellum.FST
+	hotFST   *vellum.FST
+	ccHotFST *vellum.FST
+	mapped   []*mapping // everything to release on Close
+	records  []byte
+	offsets  []byte // little-endian uint32 per record, plus a trailing sentinel
 
 	postings []byte
 	hotList  []byte
+	ccHot    []byte
 }
 
 // OpenOptions tunes how an index is brought into memory.
@@ -45,8 +50,14 @@ type SearchOptions struct {
 	Near  *LatLon // where the caller is; supersedes Home when set
 	// Pool caps how many candidates a scan may gather. It only applies to
 	// prefixes that were not hot enough to earn a precomputed list, which by
-	// construction have few keys beneath them.
+	// construction have few keys beneath them, and never to a search restricted
+	// to Countries, which considers every match.
 	Pool int
+	// Countries restricts results to these ISO-3166 alpha-2 codes; empty means
+	// everywhere. Codes the index has no places for match nothing. A restricted
+	// search ranks every match in those countries, not a sample: its results are
+	// exactly the best Limit of them.
+	Countries []string
 }
 
 // Open loads an index directory, mapping its files read-only.
@@ -96,6 +107,9 @@ func OpenWith(dir string, opts OpenOptions) (ix *Index, err error) {
 	if idx.hotList, err = load(hotFile); err != nil {
 		return nil, err
 	}
+	if idx.ccHot, err = load(countryHotFile); err != nil {
+		return nil, err
+	}
 	if want := (m.Records + 1) * 4; len(idx.offsets) != want {
 		return nil, fmt.Errorf("%s is %d bytes, want %d for %d records", recordsIdx, len(idx.offsets), want, m.Records)
 	}
@@ -105,6 +119,9 @@ func OpenWith(dir string, opts OpenOptions) (ix *Index, err error) {
 	}
 	if idx.hotFST, err = vellum.Open(filepath.Join(dir, hotFSTFile)); err != nil {
 		return nil, fmt.Errorf("open hot fst: %w", err)
+	}
+	if idx.ccHotFST, err = vellum.Open(filepath.Join(dir, countryHotFSTFile)); err != nil {
+		return nil, fmt.Errorf("open country hot fst: %w", err)
 	}
 	return idx, nil
 }
@@ -138,13 +155,19 @@ func (ix *Index) Close() error {
 		}
 		ix.hotFST = nil
 	}
+	if ix.ccHotFST != nil {
+		if herr := ix.ccHotFST.Close(); err == nil {
+			err = herr
+		}
+		ix.ccHotFST = nil
+	}
 	for _, mp := range ix.mapped {
 		if merr := mp.Close(); err == nil {
 			err = merr
 		}
 	}
 	ix.mapped = nil
-	ix.records, ix.offsets, ix.postings, ix.hotList = nil, nil, nil, nil
+	ix.records, ix.offsets, ix.postings, ix.hotList, ix.ccHot = nil, nil, nil, nil, nil
 	return err
 }
 
@@ -177,31 +200,59 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 		}
 	}
 
-	hot, err := ix.gatherHot(q, keep)
-	if err != nil {
-		return nil, err
-	}
-	if !hot {
-		if err := ix.gatherScan(q, opts.Pool, keep); err != nil {
+	var cands []candidate
+	if len(opts.Countries) > 0 {
+		var err error
+		if cands, err = ix.searchCountries(q, opts, best, keep); err != nil {
 			return nil, err
 		}
+	} else {
+		hot, err := ix.gatherHot(q, keep)
+		if err != nil {
+			return nil, err
+		}
+		if !hot {
+			if err := ix.gatherScan(q, opts.Pool, keep); err != nil {
+				return nil, err
+			}
+		}
+		cands = ix.rank(best, opts)
 	}
 
+	if len(cands) > opts.Limit {
+		cands = cands[:opts.Limit]
+	}
+	out := make([]Result, 0, len(cands))
+	for _, c := range cands {
+		r, err := ix.decode(c.ord)
+		if err != nil {
+			return nil, err
+		}
+		r.Score = c.score
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// rank applies the caller-dependent bonuses to the gathered candidates and
+// sorts them best first.
+//
+// Where the caller is depends on the caller, so it cannot be baked into the
+// stored scores; it is applied here, over the pool, before trimming.
+//
+// The country and the position add rather than replace one another. They are
+// not the same statement: the country says "somewhere you might mean", the
+// position says "how far away". Letting the position replace the country made
+// results worse, because at a typical distance proximity is worth less than
+// the flat country bonus; taking the larger of the two was no better, because
+// the flat bonus then swamps proximity entirely and two towns in the caller's
+// own country stop being distinguishable — which is most of what a position
+// is for.
+func (ix *Index) rank(best map[uint32]float64, opts SearchOptions) []candidate {
 	cands := make([]candidate, 0, len(best))
 	for ord, s := range best {
 		cands = append(cands, candidate{ord, s})
 	}
-	// Where the caller is depends on the caller, so it cannot be baked into the
-	// stored scores; it is applied here, over the pool, before trimming.
-	//
-	// The country and the position add rather than replace one another. They are
-	// not the same statement: the country says "somewhere you might mean", the
-	// position says "how far away". Letting the position replace the country made
-	// results worse, because at a typical distance proximity is worth less than
-	// the flat country bonus; taking the larger of the two was no better, because
-	// the flat bonus then swamps proximity entirely and two towns in the caller's
-	// own country stop being distinguishable — which is most of what a position
-	// is for.
 	if opts.Home != "" || opts.Near != nil {
 		home := -1
 		if opts.Home != "" {
@@ -220,32 +271,128 @@ func (ix *Index) Search(query string, opts SearchOptions) ([]Result, error) {
 			cands[i].score += bonus
 		}
 	}
-
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].score != cands[j].score {
 			return cands[i].score > cands[j].score
 		}
 		return cands[i].ord < cands[j].ord
 	})
-	if len(cands) > opts.Limit {
-		cands = cands[:opts.Limit]
+	return cands
+}
+
+// searchCountries answers a query restricted to some countries, considering
+// every match in them.
+//
+// Each country's own range is walked, unless the prefix is hot within that
+// country, in which case its shortlist is read instead. A shortlist is only a
+// sample, so it is trusted only when it provably holds everything that could
+// rank: whatever it left out scored no higher than its last entry, and the
+// caller's bonuses can lift that by at most HomeBonus plus NearBonus. If that
+// ceiling still reaches the cut-off for the requested Limit, something left out
+// could have made the results, and the country is walked after all.
+func (ix *Index) searchCountries(q string, opts SearchOptions, best map[uint32]float64, keep func(uint32, float64)) ([]candidate, error) {
+	type shortlist struct {
+		country int
+		floor   float64 // the lowest stored score on the list
 	}
-	out := make([]Result, 0, len(cands))
-	for _, c := range cands {
-		r, err := ix.decode(c.ord)
+	var (
+		it    vellum.FSTIterator
+		short []shortlist
+	)
+	for _, c := range ix.countryIndexes(opts.Countries) {
+		floor, n, err := ix.gatherCountryHot(c, q, keep)
 		if err != nil {
 			return nil, err
 		}
-		r.Score = c.score
-		out = append(out, r)
+		switch {
+		case n >= hotK:
+			short = append(short, shortlist{c, floor})
+		case n > 0:
+			// A shortlist with room to spare holds every record beneath it.
+		default:
+			if _, err := ix.scanCountry(&it, c, q, math.MaxInt, keep); err != nil {
+				return nil, err
+			}
+		}
 	}
-	return out, nil
+	cands := ix.rank(best, opts)
+	if len(short) == 0 {
+		return cands, nil
+	}
+
+	cutoff := math.Inf(-1)
+	if len(cands) >= opts.Limit {
+		cutoff = cands[opts.Limit-1].score
+	}
+	home := -1
+	if opts.Home != "" {
+		home = ix.countryIndex(opts.Home)
+	}
+	walked := false
+	for _, s := range short {
+		ceiling := s.floor
+		if s.country == home {
+			ceiling += HomeBonus
+		}
+		if opts.Near != nil {
+			ceiling += NearBonus
+		}
+		// A tie can still win on ordinal, so only a strictly lower ceiling is safe.
+		if ceiling < cutoff {
+			continue
+		}
+		if _, err := ix.scanCountry(&it, s.country, q, math.MaxInt, keep); err != nil {
+			return nil, err
+		}
+		walked = true
+	}
+	if walked {
+		cands = ix.rank(best, opts)
+	}
+	return cands, nil
+}
+
+// gatherCountryHot reads a country's shortlist for a prefix, plus the exact
+// match on the query itself, which the shortlist cannot carry the bonus for. It
+// reports how many entries the shortlist had, zero meaning the prefix is not hot
+// in that country, and the score of the last.
+func (ix *Index) gatherCountryHot(c int, q string, keep func(uint32, float64)) (floor float64, n int, err error) {
+	key := appendCountryKey(nil, c, q)
+	off, ok, err := ix.ccHotFST.Get(key)
+	if err != nil {
+		return 0, 0, fmt.Errorf("country hot lookup %q: %w", q, err)
+	}
+	if !ok {
+		return 0, 0, nil
+	}
+	if err := ix.eachEntry(ix.ccHot, off, func(ord uint32, score float64) bool {
+		keep(ord, score)
+		floor = score
+		n++
+		return true
+	}); err != nil {
+		return 0, 0, err
+	}
+	poff, exact, err := ix.fst.Get(key)
+	if err != nil {
+		return 0, 0, fmt.Errorf("exact lookup %q: %w", q, err)
+	}
+	if exact {
+		if err := ix.eachEntry(ix.postings, poff, func(ord uint32, score float64) bool {
+			keep(ord, score+ExactBonus)
+			return true
+		}); err != nil {
+			return 0, 0, err
+		}
+	}
+	return floor, n, nil
 }
 
 // gatherHot serves a prefix that has a precomputed shortlist, and reports
 // whether it did. The shortlist is a ranked sample rather than the whole range,
 // so an exact hit on the query itself is added separately: it carries a bonus
-// the build-time score could not know about.
+// the build-time score could not know about. Names are keyed by country, so
+// that takes one lookup per country.
 func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	off, ok, err := ix.hotFST.Get([]byte(q))
 	if err != nil {
@@ -260,9 +407,20 @@ func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	}); err != nil {
 		return false, err
 	}
-	if poff, exact, err := ix.fst.Get([]byte(q)); err != nil {
+	r, err := ix.fst.Reader()
+	if err != nil {
 		return false, fmt.Errorf("exact lookup %q: %w", q, err)
-	} else if exact {
+	}
+	key := make([]byte, 0, countryKeyLen+len(q))
+	for c := range ix.m.Countries {
+		key = appendCountryKey(key[:0], c, q)
+		poff, exact, err := r.Get(key)
+		if err != nil {
+			return false, fmt.Errorf("exact lookup %q: %w", q, err)
+		}
+		if !exact {
+			continue
+		}
 		if err := ix.eachEntry(ix.postings, poff, func(ord uint32, score float64) bool {
 			keep(ord, score+ExactBonus)
 			return true
@@ -273,34 +431,66 @@ func (ix *Index) gatherHot(q string, keep func(uint32, float64)) (bool, error) {
 	return true, nil
 }
 
-// gatherScan walks every key under a prefix. It is only reached for prefixes
-// that were not hot, which by construction have few keys beneath them, so the
-// pool ceiling is a safety net rather than a sampling policy.
+// gatherScan walks every key under a prefix, country by country. It is only
+// reached for prefixes that were not hot, which by construction have few keys
+// beneath them, so the pool ceiling is a safety net rather than a sampling
+// policy.
 func (ix *Index) gatherScan(q string, pool int, keep func(uint32, float64)) error {
+	var it vellum.FSTIterator // reused across countries: building one allocates
 	n := 0
-	it, err := ix.fst.Iterator([]byte(q), prefixSuccessor(q))
+	for c := range ix.m.Countries {
+		used, err := ix.scanCountry(&it, c, q, pool-n, keep)
+		if err != nil {
+			return err
+		}
+		if n += used; n >= pool {
+			break
+		}
+	}
+	return nil
+}
+
+// scanCountry walks every key under a prefix within one country, keeping at
+// most budget postings, and reports how many it kept.
+func (ix *Index) scanCountry(it *vellum.FSTIterator, c int, q string, budget int, keep func(uint32, float64)) (int, error) {
+	lo := appendCountryKey(nil, c, q)
+	n := 0
+	err := it.Reset(ix.fst, lo, prefixSuccessor(string(lo)), nil)
 	for err == nil {
 		key, off := it.Current()
 		bonus := 0.0
-		if len(key) == len(q) {
+		if len(key) == len(lo) {
 			bonus = ExactBonus
 		}
 		if perr := ix.eachEntry(ix.postings, off, func(ord uint32, score float64) bool {
 			keep(ord, score+bonus)
 			n++
-			return n < pool
+			return n < budget
 		}); perr != nil {
-			return perr
+			return n, perr
 		}
-		if n >= pool {
+		if n >= budget {
 			break
 		}
 		err = it.Next()
 	}
 	if err != nil && err != vellum.ErrIteratorDone {
-		return fmt.Errorf("search %q: %w", q, err)
+		return n, fmt.Errorf("search %q: %w", q, err)
 	}
-	return nil
+	return n, nil
+}
+
+// countryIndexes resolves country codes to manifest indexes, ignoring case,
+// duplicates and codes the index has no places for.
+func (ix *Index) countryIndexes(codes []string) []int {
+	out := make([]int, 0, len(codes))
+	for _, cc := range codes {
+		c := ix.countryIndex(strings.ToUpper(strings.TrimSpace(cc)))
+		if c >= 0 && !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (ix *Index) countryIndex(cc string) int {
