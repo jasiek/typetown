@@ -32,10 +32,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # A tag that never moves and a filename that never changes, because together
-  # they are the download URL, which is the point of publishing this way.
+  # A tag that never moves, because it is half of the download URL, which is the
+  # point of publishing this way. The other half, the asset name, is fixed per
+  # index format; see "Name the assets after the index format".
   TAG: index-latest
-  ASSET: typetown-index.zip
 
 jobs:
   build:
@@ -48,6 +48,24 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
+
+      # A binary reads exactly one index format, so each format is published
+      # under its own names and a new one never replaces an older one: replicas
+      # still running a release that reads v3 keep downloading a v3 index while
+      # v4 is published beside it. The names follow FormatVersion, so a format
+      # bump moves them without anyone having to remember to.
+      - name: Name the assets after the index format
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^[[:space:]]*FormatVersion[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' internal/index/format.go)
+          case "$v" in
+            "" | *[!0-9]*) echo "no FormatVersion in internal/index/format.go"; exit 1 ;;
+          esac
+          echo "index format v$v"
+          {
+            echo "ASSET=typetown-index-v$v.zip"
+            echo "SOURCES=SOURCES-v$v.txt"
+          } >> "$GITHUB_ENV"
 
       # Half of what the index depends on. Without this an index built by an
       # older commit would be left published after a change to the parser, the
@@ -114,9 +132,10 @@ jobs:
           echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
           echo "key=$fp-$CODE_FP" >> "$GITHUB_OUTPUT"
 
-      # The published index is the state. SOURCES.txt ships beside the archive
-      # precisely so this can be answered by reading a few hundred bytes rather
-      # than the 250 MB it describes.
+      # The published index is the state. SOURCES-v<format>.txt ships beside the
+      # archive precisely so this can be answered by reading a few hundred bytes
+      # rather than the 250 MB it describes. Only this format's index counts: one
+      # built in another format is no use to the binaries this run is for.
       - name: Compare with what is published
         id: published
         env:
@@ -135,8 +154,8 @@ jobs:
           mkdir -p "$dir"
           # Absent for the very first run, and for a release whose assets were
           # removed by hand; both mean there is nothing current to match.
-          gh release download "$TAG" --pattern SOURCES.txt --dir "$dir" || true
-          have=$(sed -n 's/^key:[[:space:]]*//p' "$dir/SOURCES.txt" 2>/dev/null || true)
+          gh release download "$TAG" --pattern "$SOURCES" --dir "$dir" || true
+          have=$(sed -n 's/^key:[[:space:]]*//p' "$dir/$SOURCES" 2>/dev/null || true)
           echo "published: ${have:-none}"
           echo "computed:  $KEY"
           if [ "$have" = "$KEY" ]; then
@@ -187,10 +206,10 @@ jobs:
             sed 's/^/  /' "$RUNNER_TEMP/upstream.txt"
           } > index/SOURCES.txt
           cat index/SOURCES.txt
-          cp index/SOURCES.txt "$RUNNER_TEMP/SOURCES.txt"
+          cp index/SOURCES.txt "$RUNNER_TEMP/$SOURCES"
 
           # Archived with the directory, so unzipping gives an index/ to point
-          # -index at rather than seven files in the current directory.
+          # -index at rather than loose files in the current directory.
           zip -qr "$RUNNER_TEMP/$ASSET" index
           (cd "$RUNNER_TEMP" && sha256sum "$ASSET" > "$ASSET.sha256")
           ls -la "$RUNNER_TEMP/$ASSET" "$RUNNER_TEMP/$ASSET.sha256"
@@ -229,6 +248,10 @@ jobs:
             echo
             echo "This release is regenerated in place whenever the GeoNames data or the"
             echo "index builder changes, so the URL above always serves the current index."
+            echo
+            echo "Each index format has its own asset, named after it, and a binary reads"
+            echo "exactly one: \`typetown version -index-format\` prints which. Assets for"
+            echo "older formats stay here, frozen, for binaries that still read them."
             echo "The \`$TAG\` tag is a fixed anchor for that URL; the commit the asset was"
             echo "built from is the one in the table, and in the SOURCES.txt inside."
             echo
@@ -240,7 +263,7 @@ jobs:
           } > "$notes"
 
           title="World index ($(date -u +%Y-%m-%d))"
-          assets="$RUNNER_TEMP/$ASSET $RUNNER_TEMP/$ASSET.sha256 $RUNNER_TEMP/SOURCES.txt"
+          assets="$RUNNER_TEMP/$ASSET $RUNNER_TEMP/$ASSET.sha256 $RUNNER_TEMP/$SOURCES"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$title" --notes-file "$notes" --prerelease
             # shellcheck disable=SC2086

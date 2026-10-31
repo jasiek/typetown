@@ -56,19 +56,28 @@ The whole-world index is published as a release asset, so nothing but `curl` is
 needed to get one:
 
 ```sh
-curl -fLO https://github.com/jasiek/typetown/releases/download/index-latest/typetown-index.zip
-unzip typetown-index.zip          # -> index/
+v=$(typetown version -index-format)   # the index format this binary reads
+curl -fLO https://github.com/jasiek/typetown/releases/download/index-latest/typetown-index-v$v.zip
+unzip typetown-index-v$v.zip          # -> index/
 typetown serve -index index
 ```
 
-That URL never changes: `.github/workflows/index.yml` regenerates the
-`index-latest` release in place. It is a release rather than a workflow
+A binary reads exactly one index format and refuses any other, so each format is
+published under its own name — `typetown-index-v4.zip` — and a new format never
+replaces an old one. Replicas still running a release that reads an older format
+keep downloading the index they can open, and a rollout can upgrade binaries and
+indexes together rather than racing a moving URL. Assets for older formats stay
+in the release, frozen at their last build. (The unversioned
+`typetown-index.zip` is the last v3 index, from before this naming.)
+
+For a given format the URL never changes: `.github/workflows/index.yml`
+regenerates the `index-latest` release in place. It is a release rather than a workflow
 artifact because an artifact is only a download for somebody logged in to
 GitHub, expires after 90 days, and has no stable address. The release is marked
 a pre-release so that it never takes the "Latest release" slot from the `v*`
 tags, which are what `go install` follows.
 
-`typetown-index.zip.sha256` and `SOURCES.txt` sit beside the archive, the
+`typetown-index-v4.zip.sha256` and `SOURCES-v4.txt` sit beside the archive, the
 second recording the commit, the run and the upstream files the index was built
 from, so a download can be traced back to where it came from without unzipping
 250 MB.
@@ -79,9 +88,18 @@ Start the workflow from the **Actions** tab → **Index** → **Run workflow**.
 Before doing anything else it works out what the index would be built from —
 the size of each input, asked of `download.geonames.org`, and a hash of the
 packages that turn those inputs into an index — and stops there when the
-published `SOURCES.txt` already names that pair. Running it again when nothing
-has moved therefore costs four HEAD requests. Tick **force** to rebuild
-regardless.
+published `SOURCES-v<format>.txt` already names that pair. Running it again
+when nothing has moved therefore costs four HEAD requests. Tick **force** to
+rebuild regardless. From a terminal:
+
+```sh
+gh workflow run index.yml --ref main              # rebuild if anything moved
+gh workflow run index.yml --ref main -f force=true
+```
+
+Run it from `main`: the release is shared, so whatever ref the run builds is
+what every download of that format gets. Runs queue rather than overlap, and a
+queued run that finds its work already published stops at the comparison.
 
 Both halves of that key are deliberate:
 
