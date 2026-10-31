@@ -368,92 +368,100 @@ would rather have the snapshot.
 
 ## The index on disk
 
-Nine files. A filled diamond means one structure contains the other; a dashed
-arrow is a pointer — a number stored in one file that addresses another. Every
-hop below is one of those numbers, so a query resolves by arithmetic rather than
-by scanning.
+Nine files, in five layers. The diagram follows London through every one of
+them, with the numbers the published index actually holds: each box is a file,
+the highlighted entry is the one the query lands on, and each arrow is a number
+stored in one file that addresses another. Every hop is one of those numbers, so
+a query resolves by arithmetic rather than by scanning.
+
+The three paths at the top are alternatives, not stages. `london` walks
+`names.fst`; `lon` has too many keys beneath it to walk on a keystroke, so it is
+served from `hot.fst`; `lo` restricted to `GB` is hot within that one country, so
+it is served from `countryhot.fst`. All three arrive at the same record ordinal.
 
 ```mermaid
-classDiagram
-    direction TB
+flowchart TB
+    q1(["london"])
+    q2(["lon"])
+    q3(["lo, countries=GB"])
 
-    class NamesFST {
-        <<names.fst — 5,781,902 entries>>
-        +uint16BE countryIdx
-        +bytes name
-        +uint64 value
-    }
-    class HotFST {
-        <<hot.fst — 6,216 entries>>
-        +bytes prefix
-        +uint64 value
-    }
-    class CountryHotFST {
-        <<countryhot.fst — 7,374 entries>>
-        +uint16BE countryIdx
-        +bytes prefix
-        +uint64 value
-    }
-    class PostingList {
-        <<postings.bin — 5,781,902 lists>>
-        +uvarint count
-    }
-    class HotList {
-        <<hot.bin — 6,216 lists, count max 256>>
-        +uvarint count
-    }
-    class CountryHotList {
-        <<countryhot.bin — 7,374 lists, count max 256>>
-        +uvarint count
-    }
-    class Posting {
-        <<9,030,366 in total>>
-        +uvarint ordinal
-        +varint score
-    }
-    class RecordsIdx {
-        <<records.idx — 4,994,823 slots>>
-        +uint32LE offset
-    }
-    class Record {
-        <<records.bin — 4,994,822 records>>
-        +uvarint id
-        +varint lat
-        +varint lon
-        +uvarint population
-        +uvarint featureIdx
-        +uvarint countryIdx
-        +uvarint regionIdx
-        +uvarint nameLen
-        +bytes name
-    }
-    class FeatureCodes {
-        <<manifest.featureCodes — 14>>
-        +string code
-    }
-    class Countries {
-        <<manifest.countries + countryNames — 248, parallel>>
-        +string cc
-        +string name
-    }
-    class Regions {
-        <<manifest.regions — 3,749, slot 0 = none>>
-        +string name
-    }
+    subgraph names ["names.fst — 5,781,902 keys"]
+        n1["<b>00 4B</b> london<br/>→ 17,461,502"]
+        n2["⋯ every (country, name),<br/>country first as uint16 BE"]
+    end
+    subgraph hot ["hot.fst — 6,216 keys"]
+        h1["lon<br/>→ 2,873,118"]
+        h2["⋯ prefixes with<br/>≥ 500 keys beneath"]
+    end
+    subgraph chot ["countryhot.fst — 7,374 keys"]
+        c1["<b>00 4B</b> lo<br/>→ 2,754,611"]
+        c2["⋯ (country, prefix) with<br/>≥ 500 keys beneath"]
+    end
 
-    PostingList *-- "count" Posting : contains
-    HotList *-- "count" Posting : contains
-    CountryHotList *-- "count" Posting : contains
+    subgraph postings ["postings.bin — one list per names.fst key"]
+        p1["@ 17,461,502<br/>count 2<br/>⟨1,707,566, 820⟩<br/>⟨1,707,565, 215⟩"]
+    end
+    subgraph hotbin ["hot.bin — one list per hot.fst key"]
+        hb1["@ 2,873,118<br/>count 256<br/>⟨1,707,566, 820⟩<br/>⋯ 255 more"]
+    end
+    subgraph chotbin ["countryhot.bin — one list per countryhot.fst key"]
+        cb1["@ 2,754,611<br/>count 256<br/>⟨1,707,566, 820⟩<br/>⋯ 255 more"]
+    end
 
-    NamesFST ..> PostingList : value = byte offset
-    HotFST ..> HotList : value = byte offset
-    CountryHotFST ..> CountryHotList : value = byte offset
-    Posting ..> RecordsIdx : ordinal = slot
-    RecordsIdx ..> Record : offset = first byte
-    Record ..> FeatureCodes : featureIdx
-    Record ..> Countries : countryIdx
-    Record ..> Regions : regionIdx
+    subgraph idx ["records.idx — uint32 LE × (records + 1)"]
+        i1["[1,707,566]<br/>47,139,583"]
+        i2["[1,707,567]<br/>47,139,609"]
+        i3["[4,994,822] sentinel<br/>141,074,592 = file length"]
+    end
+
+    subgraph rec ["records.bin — 4,994,822 variable-length records"]
+        r1["bytes 47,139,583 – 47,139,609<br/>id 2643743 · lat 5150853 · lon −12573 · population 8961989<br/>featureIdx 3 · countryIdx 75 · regionIdx 1014 · nameLen 6 · London"]
+    end
+
+    subgraph man ["manifest.json — string tables, by position"]
+        m1["featureCodes[3]<br/>PPLC"]
+        m2["countries[75] · countryNames[75]<br/>GB · United Kingdom"]
+        m3["regions[1014]<br/>England"]
+    end
+
+    q1 --> n1
+    q2 --> h1
+    q3 --> c1
+    n1 -->|byte offset| p1
+    h1 -->|byte offset| hb1
+    c1 -->|byte offset| cb1
+    p1 -->|ordinal = slot| i1
+    hb1 -->|ordinal = slot| i1
+    cb1 -->|ordinal = slot| i1
+    i1 -->|first byte| r1
+    i2 -.->|one past the last| r1
+    r1 -.->|featureIdx| m1
+    r1 -.->|countryIdx| m2
+    r1 -.->|regionIdx| m3
+
+    classDef path fill:#e3edfa,stroke:#17539e,stroke-width:2px,color:#0f1720
+    classDef lookup fill:#f7edda,stroke:#8a5a08,stroke-width:2px,color:#0f1720
+    class n1,h1,c1,p1,hb1,cb1,i1,i2,r1 path
+    class m1,m2,m3 lookup
 ```
+
+`00 4B` is the country's index in `manifest.countries` — 75, `GB` — as two
+big-endian bytes. A score is stored as a fixed-point integer, the score × 100,
+so `820` is London's 8.2. Solid arrows are byte offsets and ordinals into
+another file; dashed ones from a record are positions in a manifest table.
+
+Every list in `postings.bin`, `hot.bin` and `countryhot.bin` has the same
+encoding and is read by the same decoder:
+
+```mermaid
+flowchart LR
+    count["count<br/>uvarint"] --- o0["ordinal<br/>uvarint"] --- s0["score<br/>varint"] --- o1["ordinal<br/>uvarint"] --- s1["score<br/>varint"] --- more["⋯ count pairs,<br/>highest score first"]
+```
+
+There is no terminator and no padding, so a list can only be read forwards from
+its offset — which is exactly what an FST value hands you. Ordinals are stored
+plainly rather than delta-coded: a list is sorted by score, so the deltas would
+not be monotonic.
 
 `names.fst` is walked for every query, one country's range at a time: its keys
 are the country's index as two big-endian bytes followed by the folded name, so
